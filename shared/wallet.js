@@ -1,4 +1,3 @@
-
 (function (root) {
   'use strict';
 
@@ -245,7 +244,7 @@
         return x.id !== d.id && x.status === 'IN_PROGRESS' && (x.assigneeIds || []).indexOf(Number(employeeId)) >= 0;
       });
       if (d.status !== 'IN_PROGRESS' && active.length >= limit)
-        return { ok: false, reason: 'Aapke ' + active.length + ' tasks already in progress (limit ' + limit + '). Finish or submit one first.', code: 'WIP_LIMIT', active: active.map(function (x) { return x.title; }) };
+        return { ok: false, reason: 'You already have ' + active.length + ' tasks in progress (limit ' + limit + '). Finish or submit one first.', code: 'WIP_LIMIT', active: active.map(function (x) { return x.title; }) };
       return { ok: true };
     },
 
@@ -311,7 +310,7 @@
       notify(DB, DB.adminUser.id, 'REVIEW', empName(DB, employeeId) + ' flagged the estimate', '"' + d.title + '": ' + d.agreement.flagReason, 'DELIVERABLE', d.id);
       return ok(clone(d));
     },
-    /* Admin: employee ka proposal maan lo */
+    /* Admin: accept the employee's proposal */
     acceptProposal: function (deliverableId) {
       var DB = ensure(); var d = del(DB, deliverableId);
       if (!d) return fail('Task not found', 'NOT_FOUND');
@@ -371,7 +370,7 @@
       (d.assigneeIds || []).forEach(function (aid) {
         notify(DB, aid, 'APPROVED', 'Your block was cleared', '"' + d.title + '"' + (note ? ' \u00b7 ' + String(note).trim() : '') + '. You can start again.', 'DELIVERABLE', d.id);
       });
-      if (wasBy !== Number(byId)) notify(DB, DB.adminUser.id, 'INFO', 'Block resolved', '"' + d.title + '" \u00b7 ' + fmtT(secs) + ' blocked tha', 'DELIVERABLE', d.id);
+      if (wasBy !== Number(byId)) notify(DB, DB.adminUser.id, 'INFO', 'Block resolved', '"' + d.title + '" \u00b7 ' + 'was blocked for ' + fmtT(secs), 'DELIVERABLE', d.id);
       return ok(clone(d));
     },
     getBlocked: function () {
@@ -558,6 +557,34 @@
         ? self.addEntry(employeeId, 'BONUS', amt, why, meta)
         : Promise.resolve(null);
       return first.then(function () { return self.addEntry(employeeId, 'PAYOUT', -amt, why, meta); });
+    },
+
+    /* Undo a payment that was recorded by mistake. The ledger is never
+       edited: a correcting entry is added (and, for a direct payment, its
+       matching "earned" entry is cancelled too). */
+    reversePayment: function (entryId, reason) {
+      var DB = ensure();
+      var w = DB.walletEntries.find(function (x) { return String(x.id) === String(entryId); });
+      if (!w || w.type !== 'PAYOUT') return fail('Payment not found', 'NOT_FOUND');
+      if (DB.walletEntries.some(function (x) { return x.meta && String(x.meta.reversalOf) === String(w.id); }))
+        return fail('This payment was already undone', 'INVALID_STATE');
+      var why = 'Payment undone' + (reason ? ': ' + String(reason).trim() : '') + ' (was ' + rupee(-w.amountPaise) + ')';
+      var made = [];
+      var add = function (amt, of) {
+        var e = { id: U.newId('w'), employeeId: w.employeeId, deliverableId: null, projectId: w.projectId || null, type: 'ADJUSTMENT',
+          amountPaise: amt, why: why, createdAt: now(), meta: { manual: true, byId: DB.adminUser.id, reversalOf: of } };
+        DB.walletEntries.unshift(e); made.push(e);
+      };
+      add(-w.amountPaise, w.id);                                  // money back on their balance
+      if (w.meta && w.meta.direct) {                               // direct payment: cancel the matching "earned" line too
+        var pair = DB.walletEntries.find(function (x) {
+          return x.employeeId === w.employeeId && x.type === 'BONUS' && x.meta && x.meta.direct &&
+            x.amountPaise === -w.amountPaise && String(x.projectId) === String(w.projectId) && Math.abs(Date.parse(x.createdAt) - Date.parse(w.createdAt)) < 60000;
+        });
+        if (pair) add(-pair.amountPaise, pair.id);
+      }
+      activity(DB, '\u21A9\uFE0F', '#FEF2F2', 'Payment of ' + rupee(-w.amountPaise) + ' to <strong>' + U.esc(empName(DB, w.employeeId)) + '</strong> undone');
+      return ok(clone(made));
     },
 
     /* ── company view ── */

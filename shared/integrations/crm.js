@@ -1,4 +1,3 @@
-
 (function (root) {
   'use strict';
 
@@ -41,7 +40,8 @@
       memberIds: owner ? [owner.id] : [],
       startDate: payload.startDate || U.isoDate(new Date()),
       deadline: payload.deadline || null,
-      budgetPaise: payload.contractValuePaise || 0,
+      contractValuePaise: payload.contractValuePaise || 0,
+      budgetPaise: payload.budgetPaise || payload.contractValuePaise || 0,
       spentPaise: 0,
       description: payload.notes || ''
     }).then(function (project) {

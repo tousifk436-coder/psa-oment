@@ -1,4 +1,3 @@
-
 (function (root) {
   'use strict';
 
@@ -8,9 +7,9 @@
   var LEAVE_TYPES = {
     CL:  { key:'CL',  label:'Casual Leave',    annual:12, paid:true,  color:'#2563EB', carryForward:false },
     SL:  { key:'SL',  label:'Sick Leave',      annual:12, paid:true,  color:'#D97706', carryForward:false },
-    EL:  { key:'EL',  label:'Earned Leave',    annual:15, paid:true,  color:'#059669', carryForward:true  },
-    COMP:{ key:'COMP',label:'Comp Off',        annual:0,  paid:true,  color:'#7C3AED', carryForward:false },
-    LOP: { key:'LOP', label:'Loss of Pay',     annual:0,  paid:false, color:'#DC2626', carryForward:false }
+    EL:  { key:'EL',  label:'Earned Leave',    annual:15, paid:true,  color:'#059669', carryForward:true, hidden:true  },
+    COMP:{ key:'COMP',label:'Comp Off',        annual:0,  paid:true,  color:'#7C3AED', carryForward:false, hidden:true },
+    LOP: { key:'LOP', label:'Loss of Pay',     annual:0,  paid:false, color:'#DC2626', carryForward:false, hidden:true }
   };
 
   var LEAVE_STATUS = {
@@ -28,6 +27,7 @@
     if (!DB) return null;
     if (!DB.leaveRequests)  DB.leaveRequests = [];
     if (!DB.leaveBalances)  DB.leaveBalances = seedBalances(DB);
+    topUpBalances(DB);
     if (!DB.holidays)       DB.holidays = seedHolidays();
     if (!DB.regularisations) DB.regularisations = [];
     if (!DB.hrPolicy) DB.hrPolicy = {
@@ -117,6 +117,42 @@
       d.setDate(d.getDate() + 1);
     }
     return days;
+  }
+
+  /* Leave is earned month by month: 12 a year = 1 per month (casual, sick),
+     earned leave 15 a year = 1.25 per month. A month counts if the person
+     had joined by the 15th. Every employee gets a balance row for the
+     current year automatically (new employees too), and the entitlement
+     grows on the 1st of each month. Used and pending days are kept. */
+  function accruedDays(e, type, year, now) {
+    var annual = (LEAVE_TYPES[type] || {}).annual || 0;
+    if (!annual) return 0;
+    var joined = e.joinedAt ? new Date(e.joinedAt) : null;
+    var lastMonth = now.getFullYear() > year ? 11 : now.getMonth();
+    var months = 0;
+    for (var m = 0; m <= lastMonth; m++) {
+      if (!joined || joined <= new Date(year, m, 15, 23, 59)) months++;
+    }
+    return Math.floor(annual / 12 * months * 2 + 1e-9) / 2;
+  }
+  function topUpBalances(DB) {
+    var now = new Date(), year = now.getFullYear();
+    (DB.employees || []).forEach(function (e) {
+      if (e.active === false) return;
+      /* no joining date saved: leave starts counting from this month */
+      if (!e.joinedAt) e.joinedAt = U.isoDate(new Date(now.getFullYear(), now.getMonth(), 1));
+      Object.keys(LEAVE_TYPES).forEach(function (t) {
+        if (LEAVE_TYPES[t].hidden) return;                 // only casual + sick are used
+        var row = DB.leaveBalances.find(function (b) { return b.employeeId === e.id && b.type === t && b.year === year; });
+        if (!row) {
+          row = { id: 'bal_' + e.id + '_' + t + '_' + year, employeeId: e.id, type: t, year: year, entitled: 0, used: 0, pending: 0, extra: 0 };
+          DB.leaveBalances.push(row);
+        }
+        if (t === 'COMP') return;                          // comp-off is credited by hand
+        var target = accruedDays(e, t, year, now) + (Number(row.extra) || 0);
+        if (row.entitled !== target) row.entitled = target;
+      });
+    });
   }
 
   function balanceOf(DB, employeeId, type) {
@@ -275,11 +311,14 @@
       };
       DB.leaveRequests.unshift(req);
 
-      DB.notifications.unshift({
-        id: U.newId('n'), recipientId: approverId, kind: 'REVIEW',
-        title: 'Leave request', body: emp.name + ' \u2014 ' + LEAVE_TYPES[payload.type].label +
-          ', ' + count + ' day(s) from ' + payload.fromDate,
-        entityType: 'LEAVE', entityId: req.id, read: false, createdAt: new Date().toISOString()
+      /* the admin always sees leave requests (and the manager too, if set) */
+      [DB.adminUser.id].concat(approverId !== DB.adminUser.id ? [approverId] : []).forEach(function (rid) {
+        DB.notifications.unshift({
+          id: U.newId('n'), recipientId: rid, kind: 'REVIEW',
+          title: 'Leave request', body: emp.name + ' \u2014 ' + LEAVE_TYPES[payload.type].label +
+            ', ' + count + ' day(s) from ' + payload.fromDate,
+          entityType: 'LEAVE', entityId: req.id, read: false, createdAt: new Date().toISOString()
+        });
       });
       DB.activity.unshift({
         icon: '\uD83C\uDFD6\uFE0F', color: '#EFF6FF',
@@ -436,10 +475,12 @@
         appliedAt: new Date().toISOString()
       };
       DB.regularisations.unshift(req);
-      DB.notifications.unshift({
-        id: U.newId('n'), recipientId: req.approverId, kind: 'REVIEW',
-        title: 'Attendance regularisation', body: emp.name + ' \u2014 ' + payload.date,
-        entityType: 'REGULARISATION', entityId: req.id, read: false, createdAt: new Date().toISOString()
+      [DB.adminUser.id].concat(req.approverId !== DB.adminUser.id ? [req.approverId] : []).forEach(function (rid) {
+        DB.notifications.unshift({
+          id: U.newId('n'), recipientId: rid, kind: 'REVIEW',
+          title: 'Attendance regularisation request', body: emp.name + ' \u2014 ' + payload.date,
+          entityType: 'REGULARISATION', entityId: req.id, read: false, createdAt: new Date().toISOString()
+        });
       });
       return ok(clone(req));
     },
@@ -521,9 +562,10 @@
            power cut, or a check-in from the morning, no longer counts. */
         var seen = att && att.lastSeenAt ? Date.parse(att.lastSeenAt) : 0;
         var live = !!(att && att.firstInAt && !att.lastOutAt && seen && Date.now() - seen < 3 * 60 * 1000);
-        var state = leave ? 'ON_LEAVE'
-          : live && timer ? 'WORKING'
+        /* someone working today counts as working, even on a leave day */
+        var state = live && timer ? 'WORKING'
           : live ? 'IN_OFFICE'
+          : leave && !(att && att.firstInAt) ? 'ON_LEAVE'
           : att && att.firstInAt && !att.lastOutAt ? 'AWAY'
           : att && att.firstInAt ? 'CHECKED_OUT'
           : 'NOT_IN';

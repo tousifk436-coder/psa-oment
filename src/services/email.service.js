@@ -141,14 +141,18 @@ function queue(m) {
   const off = !s.enabled || (m.category && s.categories[m.category] === false);
   if (off && !m.force) return null;
 
-  const { html, text } = template.render({
-    company: companyName(),
+  /* the content is kept (src) so a resend can rebuild it in the current design */
+  const src = {
     heading: m.heading || m.subject,
     greeting: m.name ? 'Hi ' + firstName(m.name) + ',' : null,
-    lines: m.lines, facts: m.facts, button: m.button, footer: m.footer
-  });
+    lines: (m.lines || []).filter(x => x != null && x !== ''),
+    /* stored as {l, v} objects: some databases refuse arrays inside arrays */
+    facts: (m.facts || []).filter(f => f && f[1] != null && f[1] !== '').map(f => ({ l: String(f[0]), v: String(f[1]) })),
+    button: m.button || null, footer: m.footer || null
+  };
+  const { html, text } = template.render(Object.assign({ company: companyName() }, src, { facts: src.facts.map(f => [f.l, f.v]) }));
   const row = {
-    id: uid(), to, subject: template.plain(m.subject), body: text, html,
+    id: uid(), to, subject: template.plain(m.subject), body: text, html, src,
     kind: m.kind || 'INFO', category: m.category || 'general',
     meta: Object.assign({}, m.meta || {}, m.attachInvoiceId ? { attachInvoiceId: m.attachInvoiceId } : {}),
     status: 'QUEUED', attempts: 0, createdAt: new Date().toISOString(), nextAttemptAt: null
@@ -223,7 +227,10 @@ async function deliver(m) {
   }
   const info = await t.sendMail({
     from: env.SMTP.from, to: m.to, subject: m.subject, text: m.body, html: m.html || undefined,
-    attachments: await attachmentsFor(m)
+    attachments: await attachmentsFor(m),
+    /* a unique reference per email: stops Gmail from grouping similar emails
+       into one thread and hiding the repeated part behind "•••" */
+    headers: { 'X-Entity-Ref-ID': String(m.id || Date.now()) }
   });
   return { status: 'SENT', transport: 'smtp', messageId: info && info.messageId };
 }
@@ -299,15 +306,50 @@ function getOne(id) {
 }
 
 /* call inside a unit of work */
+/* Rebuild an email in the CURRENT design.
+   New emails keep their content (src); older ones are rebuilt from their
+   plain-text version (title, greeting, paragraphs, details, button link). */
+function rebuild(m) {
+  let src = m.src;
+  if (!src) {
+    const lines = String(m.body || '').split('\n');
+    while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+    if (lines.length && /^\u2014 /.test(lines[lines.length - 1].trim())) lines.pop();
+    const heading = (lines.shift() || m.subject || '').trim();
+    let greeting = null, button = null;
+    const paras = [];
+    lines.forEach(raw => {
+      const l = raw.trim();
+      if (!l) return;
+      const b = /^(.{1,60}?):\s*(https?:\/\/\S+)$/.exec(l);
+      if (b) { button = { label: b[1], url: b[2] }; return; }
+      if (!greeting && !paras.length && /^(Hi|Hello|Dear)\b.{0,40},$/.test(l)) { greeting = l; return; }
+      paras.push(l);
+    });
+    src = { heading: heading || m.subject, greeting, lines: paras, facts: [], button, footer: null };
+  }
+  const facts = (src.facts || []).map(f => Array.isArray(f) ? f : [f.l, f.v]);
+  const r = template.render(Object.assign({ company: companyName() }, src, { facts }));
+  return { html: r.html, text: r.text, src };
+}
+
+/* Resend: a NEW copy in today's design is queued; the original stays in the log */
 function retry(id) {
-  const m = (db().outbox || []).find(x => x.id === id);
+  const D = db();
+  const m = (D.outbox || []).find(x => x.id === id);
   if (!m) throw new ApiError('NOT_FOUND', 'Email not found');
-  if (m.status === 'SENT') throw new ApiError('INVALID_STATE', 'This email was already sent');
-  m.status = 'QUEUED'; m.attempts = 0; m.error = null; m.nextAttemptAt = null;
-  if (!m.html) adoptEngineMail(m);
-  if (m.status === 'SKIPPED') m.status = 'QUEUED';
+  if (!m.html && !m.src) adoptEngineMail(m);
+  const fresh = rebuild(m);
+  const row = {
+    id: uid(), to: m.to, subject: m.subject, body: fresh.text, html: fresh.html, src: fresh.src,
+    kind: m.kind || 'INFO', category: m.category || 'general',
+    meta: Object.assign({}, m.meta || {}, { resentFrom: m.id }),
+    status: 'QUEUED', attempts: 0, createdAt: new Date().toISOString(), nextAttemptAt: null
+  };
+  D.outbox.unshift(row);
+  trimOutbox(D);
   engine.get().DataAPI.touch();
-  return m;
+  return row;
 }
 
 async function sendTest(to) {
@@ -320,12 +362,13 @@ async function sendTest(to) {
   const t = getTransport();
   if (!t) return { ok: true, transport: 'console', message: 'SMTP_SERVICE / SMTP_HOST is not set in .env — the email was printed to the server console instead of being sent.' };
   await t.verify();
-  const info = await t.sendMail({ from: env.SMTP.from, to, subject: companyName() + ': test email', text, html });
+  const info = await t.sendMail({ from: env.SMTP.from, to, subject: companyName() + ': test email', text, html,
+    headers: { 'X-Entity-Ref-ID': 'test-' + Date.now() } });
   return { ok: true, transport: 'smtp', to, messageId: info && info.messageId };
 }
 
 module.exports = {
-  smtpConfigured, getTransport,
+  smtpConfigured, getTransport, rebuild,
   CATEGORIES, getSettings, publicSettings, updateSettings,
   adminAddress, person, isAdminId, appLink, firstName, companyName, isEmail,
   queue, queueMany, adoptEngineMail, drain, list, getOne, retry, sendTest, deliver

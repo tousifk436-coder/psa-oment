@@ -37,6 +37,13 @@ const JOBS = [
 ];
 
 /* ── clock in company time zone ── */
+/* 2026-09-30 → 30 Sep 2026 (for email titles) */
+function niceDate(iso) {
+  const [y, m, d] = String(iso).split('-').map(Number);
+  if (!y || !m || !d) return String(iso);
+  return d + ' ' + ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][m - 1] + ' ' + y;
+}
+
 function clock(d) {
   const parts = new Intl.DateTimeFormat('en-CA', { timeZone: env.TIMEZONE, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false })
     .formatToParts(d || new Date()).reduce((o, p) => (o[p.type] = p.value, o), {});
@@ -156,7 +163,7 @@ function noPunchIn(today, log) {
     email.queue({
       to: a.email, name: a.name, category: 'reminders', kind: 'NO_PUNCH_IN_SUMMARY',
       subject: missing.length + ' employee' + (missing.length > 1 ? 's have' : ' has') + ' not logged in today',
-      heading: 'Not logged in yet (' + today + ')',
+      heading: 'Not logged in yet \u2014 ' + niceDate(today),
       facts: missing.map(e => [e.name, e.role || '']),
       button: { label: 'Open HRM', url: email.appLink('ADMIN') }
     });
@@ -172,8 +179,8 @@ function missedPunchOut(today, log) {
     if (!p || !allow(log, 'nopunchout:' + a.employeeId + ':' + y, today, 30)) return;
     email.queue({
       to: p.email, name: p.name, category: 'reminders', kind: 'MISSED_PUNCH_OUT',
-      subject: 'You didn’t log out yesterday (' + y + ')',
-      heading: 'Missed log-out on ' + y,
+      subject: 'You didn’t log out yesterday (' + niceDate(y) + ')',
+      heading: 'Missed log-out on ' + niceDate(y),
       lines: ['Your attendance for yesterday has no log-out time. If the hours look wrong, request a regularisation from the Leave page.'],
       button: { label: 'Request regularisation', url: email.appLink('EMPLOYEE') }
     });
@@ -224,7 +231,7 @@ function adminDigest(today, log) {
   email.queue({
     to: a.email, name: a.name, category: 'digest', kind: 'DIGEST',
     subject: 'Daily summary — ' + counts.reduce((s, c) => s + c[1], 0) + ' things need you',
-    heading: 'Your daily summary (' + today + ')',
+    heading: 'Your daily summary \u2014 ' + niceDate(today),
     facts: counts.map(c => [c[0], String(c[1])]),
     button: { label: 'Open Oment', url: email.appLink('ADMIN') }
   });

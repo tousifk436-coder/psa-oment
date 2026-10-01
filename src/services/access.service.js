@@ -141,7 +141,7 @@ const GUARDS = {
 
     getActivity: 'admin', getCallLogs: 'admin',
     getRevenueSeries: 'admin', getKpis: 'admin',
-    projectProgress: 'any', milestoneProgress: 'any', employeeScore: selfArg(0)
+    projectProgress: 'any', milestoneProgress: 'any', deliverableProgress: 'any', employeeScore: selfArg(0)
   },
 
   HRM: {
@@ -183,7 +183,7 @@ const GUARDS = {
     unblock: (user, args) => { if (user.role !== 'ADMIN') args[1] = user.empId; return assigneeArg(0)(user, args); },
     getBlocked: 'admin',
     getWallet: moneyGated(selfArg(0)), getLedger: moneyGated((user, args) => { if (user.role !== 'ADMIN') args[0] = Object.assign({}, args[0], { employeeId: user.empId }); return args; }),
-    addEntry: 'admin', recordEmployeePayment: 'admin',
+    addEntry: 'admin', recordEmployeePayment: 'admin', reversePayment: 'admin',
     raiseDispute: moneyGated((user, args) => { if (user.role !== 'ADMIN') args[1] = user.empId; return args; }),
     resolveDispute: 'admin',
     getDisputes: moneyGated((user, args) => { if (user.role !== 'ADMIN') args[0] = Object.assign({}, args[0], { employeeId: user.empId }); return args; }),

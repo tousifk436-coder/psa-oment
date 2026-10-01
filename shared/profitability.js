@@ -1,4 +1,3 @@
-
 (function (root) {
   'use strict';
 
@@ -40,10 +39,12 @@
     var costPaise = 0, attributedSecs = 0, contributors = [];
 
     if (del.pricingMode === 'PIECE') {
-      var payPaise = del.settlement ? del.settlement.finalPaise : (del.pricePaise || 0);
-      var pieceCost = Math.round(payPaise * (DB.settings.overheadMultiplier || 1.4));
+      /* Fixed-price task: the cost is the payout once the task is approved.
+         Before that nothing has been spent yet — the price is counted in the
+         forecast (remaining cost), not as money already spent. */
+      var pieceCost = del.settlement ? (del.settlement.finalPaise || 0) : 0;
       return { costPaise: pieceCost, secs: del.loggedSecs || 0, attributedSecs: del.loggedSecs || 0, contributors: [{
-        employeeId: null, name: (del.settlement ? 'Piece-rate payout' : 'Piece-rate price (committed)'),
+        employeeId: null, name: (del.settlement ? 'Fixed-price payout' : 'Fixed price (not paid yet)'),
         avatarInitials: '\u20B9', avatarBg: 'var(--s3)', avatarFg: 'var(--t2)',
         secs: del.loggedSecs || 0, costPaise: pieceCost, loadedRatePaise: null, attributed: !!del.settlement, piece: true
       }] };
@@ -95,6 +96,11 @@
     var secs = 0, costPaise = 0;
     deliverables.forEach(function (d) {
       if (d.status === 'DONE') return;
+      if (d.pricingMode === 'PIECE') {                    // fixed price still to be paid
+        costPaise += d.pricePaise || 0;
+        secs += Math.max(0, (d.estimateSecs || 0) - (d.loggedSecs || 0));
+        return;
+      }
       var remaining = Math.max(0, (d.estimateSecs || 0) - (d.loggedSecs || 0));
       if (remaining === 0 && d.estimateSecs > 0) remaining = Math.round(d.estimateSecs * 0.25);
       var ids = d.assigneeIds || [];
@@ -216,16 +222,29 @@
         };
       }).sort(function (a, b) { return b.costPaise - a.costPaise; });
 
+      /* money paid to people for this project outside task pay
+         (milestone pay, direct payments/salary for the project) */
+      var extraCost = (DB.walletEntries || []).filter(function (w) {
+        return w.projectId === pid && !w.deliverableId && w.type !== 'PAYOUT' && w.amountPaise > 0;
+      }).reduce(function (t, w) { return t + w.amountPaise; }, 0);
+      if (extraCost) {
+        costPaise += extraCost;
+        delRows.push({ id: 'extra', title: 'Milestone pay & direct payments', status: 'DONE', milestoneId: null, estimateSecs: 0, actualSecs: 0,
+          costPaise: extraCost, overrunPct: null, milestoneAmountPaise: 0, currentPayoutPaise: null, finalPayoutPaise: null, contributors: [] });
+      }
+
       /* ── REVENUE — teen alag number ── */
+      /* a draft has not been billed to the client yet */
       var invs = DB.invoices.filter(function (i) {
-        return i.projectId === pid && i.status !== 'CANCELLED';
+        return i.projectId === pid && i.status !== 'CANCELLED' && i.status !== 'DRAFT';
       });
       var invoicedPaise = invs.reduce(function (s, i) { return s + i.subtotalPaise; }, 0);
       var collectedPaise = invs.reduce(function (s, i) {
         if (!i.totalPaise) return s;
         return s + Math.round(i.paidPaise * (i.subtotalPaise / i.totalPaise));
       }, 0);
-      var contractPaise = p.budgetPaise || 0;
+      var contractPaise = p.contractValuePaise || p.budgetPaise || 0;
+      collectedPaise += p.advancePaidPaise || 0;            // advance taken at the start
 
       var billableMs = DB.milestones.filter(function (m) { return m.projectId === pid && m.billable; });
       var doneUnbilled = billableMs.filter(function (m) {
@@ -258,12 +277,23 @@
         : projectedMarginPct < target ? 'BELOW_TARGET'
         : 'HEALTHY';
 
-      var effectiveRatePaise = loggedSecs > 0
-        ? Math.round(recognisedPaise / (loggedSecs / 3600)) : 0;
+      var effectiveRatePaise = loggedSecs >= 3600
+        ? Math.round(recognisedPaise / (loggedSecs / 3600)) : null;   // too little time to say
 
       /* Budget burn — how much of the contract value is used up */
       var burnPct = contractPaise > 0 ? Math.round(costPaise / contractPaise * 100) : null;
-      var deliveryPct = DataAPI.projectProgress(pid);
+      /* delivered = finished work (time logged is not delivery: an overrun
+         task has lots of time but is not done) — weighted by estimate */
+      var pDs = (DB.deliverables || []).filter(function (d) { return d.projectId === pid; });
+      var deliveryPct;
+      if (pDs.length) {
+        var wSum = 0, dSum = 0;
+        pDs.forEach(function (d) {
+          var wt = d.estimateSecs > 0 ? d.estimateSecs : 3600;
+          wSum += wt; dSum += wt * (d.status === 'DONE' ? 100 : d.status === 'IN_REVIEW' ? 90 : 0);
+        });
+        deliveryPct = Math.round(dSum / wSum);
+      } else deliveryPct = DataAPI.projectProgress(pid);
 
       return Promise.resolve({
         projectId: p.id, name: p.name, client: p.clientName, status: p.status,
@@ -273,7 +303,7 @@
         collectedPaise: collectedPaise,
         wipPaise: wipPaise,
         uninvoicedMilestones: doneUnbilled.length,
-        outstandingPaise: invoicedPaise - collectedPaise,
+        outstandingPaise: Math.max(0, invoicedPaise - collectedPaise),
 
         costPaise: costPaise,
         loggedSecs: loggedSecs,
@@ -325,9 +355,9 @@
         totals.projectedMarginPaise = totals.contractPaise - totals.projectedCostPaise;
         totals.projectedMarginPct = totals.contractPaise > 0
           ? Math.round(totals.projectedMarginPaise / totals.contractPaise * 100) : null;
-        totals.effectiveRatePaise = totals.loggedSecs > 0
-          ? Math.round(recognised / (totals.loggedSecs / 3600)) : 0;
-        totals.outstandingPaise = totals.invoicedPaise - totals.collectedPaise;
+        totals.effectiveRatePaise = totals.loggedSecs >= 3600
+          ? Math.round(recognised / (totals.loggedSecs / 3600)) : null;
+        totals.outstandingPaise = Math.max(0, totals.invoicedPaise - totals.collectedPaise);
 
         rows.sort(function (a, b) {
           var order = { LOSS:0, CRITICAL:1, BELOW_TARGET:2, HEALTHY:3, UNKNOWN:4 };
@@ -359,8 +389,8 @@
           var c = map[k];
           c.marginPaise = c.invoicedPaise - c.costPaise;
           c.marginPct = c.invoicedPaise > 0 ? Math.round(c.marginPaise / c.invoicedPaise * 100) : null;
-          c.effectiveRatePaise = c.loggedSecs > 0
-            ? Math.round(c.invoicedPaise / (c.loggedSecs / 3600)) : 0;
+          c.effectiveRatePaise = c.loggedSecs >= 3600
+            ? Math.round(c.invoicedPaise / (c.loggedSecs / 3600)) : null;
           return c;
         }).sort(function (a, b) { return b.marginPaise - a.marginPaise; });
       });

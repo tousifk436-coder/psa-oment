@@ -46,6 +46,15 @@ function categoryOf(n) {
   }
 }
 
+/* due date picked as a date only (stored as midnight) → show just the date */
+function dueText(iso) {
+  const d = new Date(iso);
+  const dateOnly = d.getUTCHours() === 0 && d.getUTCMinutes() === 0;
+  return d.toLocaleString('en-IN', dateOnly
+    ? { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' }
+    : { day: 'numeric', month: 'short', year: 'numeric', hour: 'numeric', minute: '2-digit', timeZone: env.TIMEZONE });
+}
+
 function extraLines(D, n) {
   if (n.entityType === 'NOTICE') {
     const nt = (D.notices || []).find(x => String(x.id) === String(n.entityId));
@@ -58,7 +67,7 @@ function extraLines(D, n) {
       const p = (D.projects || []).find(x => x.id === d.projectId);
       return [
         p ? 'Project: ' + p.name : '',
-        d.dueAt ? 'Due: ' + new Date(d.dueAt).toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short', timeZone: env.TIMEZONE }) : '',
+        d.dueAt ? 'Due: ' + dueText(d.dueAt) : '',
         d.description ? d.description : ''
       ];
     }

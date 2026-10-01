@@ -1,4 +1,3 @@
-
 (function (root) {
   'use strict';
 
@@ -344,7 +343,7 @@
       if (DB.employees.some(function (e) { return e.email === payload.email; }))
         return fail('An employee with this email already exists', 'DUPLICATE');
       var maxId = DB.employees.reduce(function (m, e) { return Math.max(m, e.id); }, 0);
-      var emp = S.Shape.employee(Object.assign({ id: maxId + 1 }, payload));
+      var emp = S.Shape.employee(Object.assign({ joinedAt: U.isoDate(new Date()) }, Object.assign({ id: maxId + 1 }, payload)));
       emp.score = payload.score || 0;
       emp.color = payload.color || emp.avatarBg;
       emp.canLogin = payload.canLogin !== false;
@@ -1268,39 +1267,54 @@
     },
 
     /* ── derived helpers ───────────────────────────────────────────────── */
+    /* Progress of one deliverable, 0–100, from real work:
+         done 100 · in review 90 · started: time logged against the estimate
+         (and finished sub-tasks), between 5 and 85 · not started 0.
+       A running timer counts too, so the bar moves while someone works. */
+    deliverableProgress: function (dOrId) {
+      var d = typeof dOrId === 'object' ? dOrId : (DB.deliverables || []).find(function (x) { return String(x.id) === String(dOrId); });
+      if (!d) return 0;
+      if (d.status === 'DONE') return 100;
+      if (d.status === 'IN_REVIEW') return 90;
+      var logged = d.loggedSecs || 0;
+      (DB.timeEntries || []).forEach(function (t) {
+        if (String(t.deliverableId) === String(d.id) && !t.endedAt && t.startedAt) logged += Math.max(0, (Date.now() - Date.parse(t.startedAt)) / 1000);
+      });
+      var subs = (DB.subtasks || []).filter(function (s) { return String(s.deliverableId) === String(d.id); });
+      var subPct = subs.length ? subs.filter(function (s) { return s.status === 'DONE'; }).length / subs.length * 85 : 0;
+      var timePct = d.estimateSecs > 0 ? Math.min(1, logged / d.estimateSecs) * 85 : (logged > 0 ? 30 : 0);
+      var started = logged > 0 || d.status === 'IN_PROGRESS' || d.status === 'REJECTED' || subPct > 0;
+      if (!started) return Math.max(0, Math.min(85, d.progressPct || 0));
+      return Math.round(Math.max(5, timePct, subPct, Math.min(85, d.progressPct || 0)));
+    },
+    /* Project progress: every deliverable's progress, weighted by its
+       estimated hours (bigger tasks count more). Projects without
+       deliverables use their milestones' status. */
     projectProgress: function (projectId) {
       var pid = Number(projectId);
-      var ms = DB.milestones.filter(function (m) { return m.projectId === pid; });
       var ds = DB.deliverables.filter(function (d) { return d.projectId === pid; });
-      if (!ms.length && !ds.length) return 0;
-
-      var msPct = ms.length
-        ? ms.reduce(function (s, m) {
-            if (m.status === 'DONE') return s + 100;
-            if (m.status === 'IN_PROGRESS') {
-              var p = DataAPI.milestoneProgress(m.id);
-              return s + (p.total ? p.pct : 25);
-            }
-            return s;
-          }, 0) / ms.length
-        : 0;
-
-      var dsPct = ds.length
-        ? ds.reduce(function (s, d) {
-            if (d.status === 'DONE') return s + 100;
-            return s + Math.min(95, d.progressPct || 0);
-          }, 0) / ds.length
-        : msPct;
-
-      if (!ms.length) return Math.round(dsPct);
-      if (!ds.length) return Math.round(msPct);
-      return Math.round(msPct * 0.7 + dsPct * 0.3);
+      if (ds.length) {
+        var w = 0, sum = 0;
+        ds.forEach(function (d) {
+          var wt = d.estimateSecs > 0 ? d.estimateSecs : 3600;
+          w += wt; sum += wt * DataAPI.deliverableProgress(d);
+        });
+        return Math.round(sum / w);
+      }
+      var ms = DB.milestones.filter(function (m) { return m.projectId === pid; });
+      if (!ms.length) return 0;
+      return Math.round(ms.reduce(function (s, m) {
+        return s + (m.status === 'DONE' ? 100 : m.status === 'IN_PROGRESS' ? 25 : 0);
+      }, 0) / ms.length);
     },
+    /* done/total = finished deliverables; pct = real progress of its work */
     milestoneProgress: function (milestoneId) {
       var ds = DB.deliverables.filter(function (d) { return d.milestoneId === Number(milestoneId); });
       if (!ds.length) return { done: 0, total: 0, pct: 0 };
       var done = ds.filter(function (d) { return d.status === 'DONE'; }).length;
-      return { done: done, total: ds.length, pct: Math.round(done / ds.length * 100) };
+      var w = 0, sum = 0;
+      ds.forEach(function (d) { var wt = d.estimateSecs > 0 ? d.estimateSecs : 3600; w += wt; sum += wt * DataAPI.deliverableProgress(d); });
+      return { done: done, total: ds.length, pct: Math.round(sum / w) };
     },
     employeeScore: function (employeeId) {
       /* Score 0–100 from four REAL signals. A part with no data yet is left

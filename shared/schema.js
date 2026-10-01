@@ -1,4 +1,3 @@
-
 (function (root) {
   'use strict';
 
@@ -410,9 +409,15 @@
        * and cannot be greater than the
        * project budget.
        */
+      /* Total project value: what the client pays for the whole project.
+         budgetPaise is the internal cost budget (salaries, expenses).
+         Older projects only had budgetPaise, so the value falls back to it. */
+      var contractValuePaise =
+        Math.max(0, Math.round(Number(o.contractValuePaise != null && o.contractValuePaise !== '' ? o.contractValuePaise : o.budgetPaise) || 0));
+
       var advancePaidPaise =
         Math.min(
-          budgetPaise,
+          (contractValuePaise || budgetPaise),
           Math.max(
             0,
             Math.round(
@@ -440,6 +445,12 @@
 
         clientEmail:
           o.clientEmail || '',
+
+        /* client details used on invoices */
+        clientPhone: o.clientPhone || '',
+        clientGstin: o.clientGstin || '',
+        clientStateCode: o.clientStateCode || '',
+        clientAddress: o.clientAddress || '',
 
         status:
           normProjectStatus(
@@ -476,6 +487,9 @@
         budgetPaise:
           budgetPaise,
 
+        contractValuePaise:
+          contractValuePaise,
+
         spentPaise:
           spentPaise,
 
@@ -483,7 +497,12 @@
          * Client advance/payment already received.
          */
         advancePaidPaise:
-          advancePaidPaise
+          advancePaidPaise,
+
+        /* when and how the advance was paid */
+        advanceDate: o.advanceDate || null,
+        advanceMethod: o.advanceMethod || '',
+        advanceRef: o.advanceRef || ''
       };
     },
 

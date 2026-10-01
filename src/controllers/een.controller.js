@@ -19,3 +19,7 @@ exports.signals = asyncHandler(async (req, res) => {
   const result = await access.call(req.user, 'EenSignals', admin ? 'scanForAdmin' : 'scanForEmployee', admin ? [] : [req.user.empId]);
   res.json({ ok: true, result });
 });
+
+
+
+
