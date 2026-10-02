@@ -253,14 +253,18 @@ test('wallet: pricing, agreement, block, settle, disputes, payouts (emails)', as
   ok(await api(ADMIN, 'GET', '/api/wallet-estimate-behaviour'));
   ok(await api(ADMIN, 'GET', '/api/wallet-outbox'));
   ok(await api(ROHAN, 'GET', '/api/focus-queue/' + ROHAN_ID));
-  /* payment sent to an employee: direct (salary / project fee) and from the balance */
+  /* recording a payment: it only reduces what is owed, never adds to earnings;
+     paying more than is owed is allowed (advance) and can be undone */
   const before = ok(await api(ADMIN, 'GET', '/api/wallet/' + ROHAN_ID)).json.result;
-  ok(await api(ADMIN, 'POST', '/api/wallet/payments', { employeeId: ROHAN_ID, amountPaise: 150000, mode: 'DIRECT', method: 'UPI', reference: 'UTR77', projectId: S.project, note: 'Project fee' }));
-  const after = ok(await api(ADMIN, 'GET', '/api/wallet/' + ROHAN_ID)).json.result;
   const bal = w => (w.entries || []).reduce((s, e) => s + e.amountPaise, 0);
-  assert.equal(bal(after), bal(before), 'direct payment leaves the balance unchanged');
-  assert.ok(after.entries.filter(e => e.projectId === S.project).length >= 2, 'linked to the project');
-  assert.equal((await api(ADMIN, 'POST', '/api/wallet/payments', { employeeId: ROHAN_ID, amountPaise: 999999999, mode: 'WALLET' })).status, 400, 'cannot pay more than the balance from the wallet');
+  const earned = w => (w.entries || []).filter(e => e.type !== 'PAYOUT').reduce((s, e) => s + e.amountPaise, 0);
+  const pay = ok(await api(ADMIN, 'POST', '/api/wallet/payments', { employeeId: ROHAN_ID, amountPaise: 150000, method: 'UPI', reference: 'UTR77', projectId: S.project, note: 'Part payment' })).json.result;
+  const after = ok(await api(ADMIN, 'GET', '/api/wallet/' + ROHAN_ID)).json.result;
+  assert.equal(bal(after), bal(before) - 150000, 'balance goes down by the payment');
+  assert.equal(earned(after), earned(before), 'earnings do not change when you pay');
+  ok(await api(ADMIN, 'POST', '/api/wallet/payments', { employeeId: ROHAN_ID, amountPaise: 99999999, note: 'advance' }), 'paying more than owed is an advance');
+  ok(await rpc(ADMIN, 'Wallet', 'reversePayment', [pay.id, 'mistake']), 'a payment can be undone');
+  assert.equal((await rpc(ADMIN, 'Wallet', 'reversePayment', [pay.id, 'again'])).status, 409, 'only once');
 });
 
 test('ledger is append-only at the storage layer', async () => {
@@ -488,7 +492,9 @@ test('reminder jobs + worker delivers (console transport)', async () => {
   ok(await api(ADMIN, 'POST', '/api/emails/process'));
   const list = ok(await api(ADMIN, 'GET', '/api/emails?status=LOGGED&limit=5')).json.result;
   assert.ok(list.total > 0 && list.items[0].transport === 'console');
-  ok(await api(ADMIN, 'POST', '/api/emails/' + list.items[0].id + '/retry'));
+  const resent = ok(await api(ADMIN, 'POST', '/api/emails/' + list.items[0].id + '/retry')).json.result;
+  assert.notEqual(resent.id, list.items[0].id, 'resend makes a new copy');
+  assert.ok(/Sent by Oment/.test(resent.html || ''), 'rebuilt in the current design');
 });
 
 /* ── persistence: MongoDB holds exactly what the engine has ──────────── */

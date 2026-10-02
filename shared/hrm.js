@@ -560,8 +560,8 @@
         /* "Working" / "Checked in" only while the employee app is really open
            (a heartbeat in the last 3 minutes). A timer left running after a
            power cut, or a check-in from the morning, no longer counts. */
-        var seen = att && att.lastSeenAt ? Date.parse(att.lastSeenAt) : 0;
-        var live = !!(att && att.firstInAt && !att.lastOutAt && seen && Date.now() - seen < 3 * 60 * 1000);
+        /* present = pressed "Log in" and not logged out yet, even if the app is closed */
+        var live = !!(att && att.firstInAt && !att.lastOutAt);
         /* someone working today counts as working, even on a leave day */
         var state = live && timer ? 'WORKING'
           : live ? 'IN_OFFICE'
@@ -578,6 +578,7 @@
           leaveType: leave ? leave.type : null,
           firstInAt: att ? att.firstInAt : null,
           lastSeenAt: att ? att.lastSeenAt || null : null,
+          lateReason: att ? att.lateReason || null : null,
           activeSecs: att ? att.activeSecs : 0,
           workingOn: del ? del.title : null,
           flags: dayFlags(att, DB)

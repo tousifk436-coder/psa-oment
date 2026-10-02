@@ -42,7 +42,13 @@
       /* Fixed-price task: the cost is the payout once the task is approved.
          Before that nothing has been spent yet — the price is counted in the
          forecast (remaining cost), not as money already spent. */
-      var pieceCost = del.settlement ? (del.settlement.finalPaise || 0) : 0;
+      /* what was really credited for this task in the pay ledger (all
+         assignees together, after late cuts and disputes) — the same money
+         the Projects page and Pay team show */
+      var credited = (DB.walletEntries || []).filter(function (w) {
+        return String(w.deliverableId) === String(del.id) && w.type !== 'PAYOUT';
+      }).reduce(function (t, w) { return t + (w.amountPaise || 0); }, 0);
+      var pieceCost = del.settlement ? Math.max(0, credited) : 0;
       return { costPaise: pieceCost, secs: del.loggedSecs || 0, attributedSecs: del.loggedSecs || 0, contributors: [{
         employeeId: null, name: (del.settlement ? 'Fixed-price payout' : 'Fixed price (not paid yet)'),
         avatarInitials: '\u20B9', avatarBg: 'var(--s3)', avatarFg: 'var(--t2)',
@@ -224,9 +230,12 @@
 
       /* money paid to people for this project outside task pay
          (milestone pay, direct payments/salary for the project) */
-      var extraCost = (DB.walletEntries || []).filter(function (w) {
-        return w.projectId === pid && !w.deliverableId && w.type !== 'PAYOUT' && w.amountPaise > 0;
-      }).reduce(function (t, w) { return t + w.amountPaise; }, 0);
+      var payoutIds = {};
+      (DB.walletEntries || []).forEach(function (w) { if (w.type === 'PAYOUT') payoutIds[w.id] = 1; });
+      var extraCost = Math.max(0, (DB.walletEntries || []).filter(function (w) {
+        if ((w.type === 'BONUS' && w.meta && w.meta.direct) || (w.meta && w.meta.cancels)) return false;      // old payment-as-earnings lines (they cancel out)
+        return w.projectId === pid && !w.deliverableId && w.type !== 'PAYOUT' && !(w.meta && w.meta.reversalOf && payoutIds[w.meta.reversalOf]);
+      }).reduce(function (t, w) { return t + w.amountPaise; }, 0));
       if (extraCost) {
         costPaise += extraCost;
         delRows.push({ id: 'extra', title: 'Milestone pay & direct payments', status: 'DONE', milestoneId: null, estimateSecs: 0, actualSecs: 0,
@@ -244,7 +253,10 @@
         return s + Math.round(i.paidPaise * (i.subtotalPaise / i.totalPaise));
       }, 0);
       var contractPaise = p.contractValuePaise || p.budgetPaise || 0;
-      collectedPaise += p.advancePaidPaise || 0;            // advance taken at the start
+      /* advance + invoice payments, never counted twice (same rule as everywhere) */
+      var grossReceived = U.clientReceivedPaise(p, DB.invoices);
+      var grossBilled = invs.reduce(function (t, i) { return t + (i.totalPaise || 0); }, 0);
+      collectedPaise = grossBilled > 0 ? Math.round(grossReceived * invoicedPaise / grossBilled) : grossReceived;
 
       var billableMs = DB.milestones.filter(function (m) { return m.projectId === pid && m.billable; });
       var doneUnbilled = billableMs.filter(function (m) {

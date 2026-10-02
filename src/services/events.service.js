@@ -80,6 +80,24 @@ function after(ctx, mark, call) {
     const D = ctx.DataAPI.raw();
     explicit(ctx, D, mark, call);
 
+    /* invoices the engine created and sent by itself (project created /
+       completed) → email them to the client with the PDF, once */
+    (D.invoices || []).forEach(inv => {
+      if (!inv.autoEmail || inv.autoEmailQueued || !inv.clientEmail) return;
+      inv.autoEmailQueued = true;
+      const company = email.companyName();
+      const balance = (inv.totalPaise || 0) - (inv.paidPaise || 0);
+      email.queue({
+        to: inv.clientEmail, name: inv.clientName, category: 'invoices', kind: 'INVOICE',
+        subject: 'Invoice ' + inv.number + ' from ' + company,
+        heading: 'Invoice ' + inv.number,
+        lines: ['Please find your invoice attached as a PDF.', inv.notes || ''],
+        facts: [['Invoice', inv.number], ['Issue date', inv.issueDate], ['Due date', inv.dueDate], ['Total', rupee(inv.totalPaise)],
+          ['Paid', inv.paidPaise ? rupee(inv.paidPaise) : null], ['Balance due', rupee(balance)]],
+        attachInvoiceId: inv.id
+      });
+    });
+
     /* engine-queued mails (wallet credit, payout) */
     const engineMailTo = new Set();
     (D.outbox || []).forEach(m => {

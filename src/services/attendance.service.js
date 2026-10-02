@@ -53,6 +53,7 @@ function merge(a, body) {
     });
   }
   if (!a.firstInAt) a.firstInAt = new Date().toISOString();
+  if (body.lateReason) a.lateReason = String(body.lateReason).trim().slice(0, 300);
   /* working right now → present. "Half day" is decided only at log-out, so
      logging in again the same day clears an earlier half-day mark. */
   if (!a.status || a.status === 'ABSENT' || (a.status === 'HALF_DAY' && !a.lastOutAt)) a.status = 'PRESENT';

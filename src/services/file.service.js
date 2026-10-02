@@ -48,9 +48,14 @@ function canRead(user, file) {
   if (user.role === 'ADMIN') return true;
   if (file.metadata && file.metadata.uploadedBy === user.subject) return true;
   const id = String(file._id);
-  const ds = engine.get().DataAPI.raw().deliverables || [];
-  return ds.some(d => (d.assigneeIds || []).includes(user.empId) &&
+  const D = engine.get().DataAPI.raw();
+  const onTask = (D.deliverables || []).some(d => (d.assigneeIds || []).includes(user.empId) &&
     [].concat(d.briefFiles || [], d.submissionFiles || []).some(f => f && String(f.fileId) === id));
+  /* attachments of a notice that was sent to this employee */
+  const onNotice = (D.notices || []).some(n => String(n.status).toUpperCase() === 'SENT' &&
+    [].concat(n.readBy || [], n.notReadBy || []).includes(user.empId) &&
+    (n.attachments || []).some(a => a && String(a.fileId) === id));
+  return onTask || onNotice;
 }
 
 function stream(file) {

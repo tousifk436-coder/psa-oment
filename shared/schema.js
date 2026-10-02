@@ -499,6 +499,12 @@
         advancePaidPaise:
           advancePaidPaise,
 
+        /* automatic invoices: when the project is created (full value) and
+           when it is completed (whatever is still not invoiced) */
+        autoInvoiceOnCreate: !!o.autoInvoiceOnCreate,
+        autoInvoiceOnComplete: o.autoInvoiceOnComplete !== false,
+        completedAt: o.completedAt || null,
+
         /* when and how the advance was paid */
         advanceDate: o.advanceDate || null,
         advanceMethod: o.advanceMethod || '',

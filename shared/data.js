@@ -294,12 +294,91 @@
     };
   }
 
+  /* Share a milestone's amount between its tasks that take their price from
+     it: approved tasks keep what they were paid; the rest of the amount is
+     split equally between the tasks still open. */
+  function splitMilestoneAmount(m) {
+    var ds = DB.deliverables.filter(function (d) { return d.milestoneId === m.id && d.priceFromMilestone; });
+    var settled = ds.filter(function (d) { return d.settlement; });
+    var open = ds.filter(function (d) { return !d.settlement; });
+    if (!open.length) return;
+    var used = settled.reduce(function (t, d) { return t + (d.pricePaise || 0); }, 0);
+    var left = Math.max(0, (m.amountPaise || 0) - used);
+    var each = Math.floor(left / open.length);
+    open.forEach(function (d, i) { d.pricePaise = i === open.length - 1 ? left - each * (open.length - 1) : each; });
+  }
+
+  /* ── Automatic invoices ────────────────────────────────────────────── */
+  function projectBilledSub(pid) {
+    return DB.invoices.filter(function (i) { return i.projectId === pid && i.status !== 'CANCELLED'; })
+      .reduce(function (t, i) { return t + (i.subtotalPaise || 0); }, 0);
+  }
+  /* kind: 'CREATE' (full value) | 'COMPLETE' (what is left to bill) */
+  function autoInvoice(p, kind) {
+    var value = p.contractValuePaise || p.budgetPaise || 0;
+    var left = kind === 'CREATE' ? value : Math.max(0, value - projectBilledSub(p.id));
+    if (left <= 0 || !p.clientName) return null;
+    var due = new Date(); due.setDate(due.getDate() + 15);
+    var r = buildInvoice({
+      clientName: p.clientName, clientEmail: p.clientEmail || '', clientGstin: p.clientGstin || '', placeOfSupply: p.clientStateCode || '',
+      projectId: p.id, milestoneId: null,
+      subject: (kind === 'CREATE' ? 'Project invoice \u2014 ' : 'Final invoice \u2014 ') + p.name,
+      lines: [{ description: p.name + (kind === 'CREATE' ? ' \u2014 project value' : ' \u2014 balance on completion'), qty: 1, ratePaise: left }],
+      dueDate: U.isoDate(due), status: 'DRAFT',
+      notes: kind === 'CREATE' ? 'Created automatically when the project was set up.' : 'Created automatically when the project was completed.'
+    });
+    if (r.error) return null;
+    var inv = r.invoice;
+    inv.autoCreated = kind;
+    /* an advance already taken counts as a payment on this invoice */
+    var advLeft = (p.advancePaidPaise || 0) - (p.advanceAppliedPaise || 0);
+    if (advLeft > 0) {
+      var use = Math.min(advLeft, inv.totalPaise);
+      inv.payments = (inv.payments || []).concat({ id: U.newId('pay'), amountPaise: use, date: p.advanceDate || U.isoDate(new Date()),
+        method: 'Advance', reference: p.advanceRef || '', note: 'Advance adjusted', at: new Date().toISOString() });
+      inv.paidPaise = (inv.paidPaise || 0) + use;
+      p.advanceAppliedPaise = (p.advanceAppliedPaise || 0) + use;
+    }
+    /* sent straight away when we have the client's email (the server emails it with the PDF) */
+    if (p.clientEmail) {
+      inv.status = inv.paidPaise >= inv.totalPaise ? 'PAID' : inv.paidPaise > 0 ? 'PARTIALLY_PAID' : 'SENT';
+      inv.sentAt = inv.lastSentAt = new Date().toISOString();
+      inv.autoEmail = true;
+    } else if (inv.paidPaise > 0) {
+      inv.status = inv.paidPaise >= inv.totalPaise ? 'PAID' : 'PARTIALLY_PAID';
+    }
+    notify(DB.adminUser.id, 'INFO', 'Invoice ' + inv.number + ' created automatically',
+      p.name + ' \u2014 ' + U.fmtRupee(inv.totalPaise) + (p.clientEmail ? ', emailed to ' + p.clientEmail : ' (draft: add the client email to send it)'), 'INVOICE', inv.id);
+    return inv;
+  }
+  /* all tasks approved → the project is completed */
+  function autoCompleteProject(pid) {
+    var p = DB.projects.find(function (x) { return x.id === pid; });
+    if (!p || p.status === 'COMPLETED' || p.status === 'CANCELLED') return;
+    var ds = DB.deliverables.filter(function (d) { return d.projectId === pid; });
+    if (!ds.length || ds.some(function (d) { return d.status !== 'DONE'; })) return;
+    p.status = 'COMPLETED';
+    p.completedAt = new Date().toISOString();
+    logActivity('\uD83C\uDFC1', '#ECFDF5', 'Project <strong>' + U.esc(p.name) + '</strong> completed \u2014 all tasks approved');
+    notify(DB.adminUser.id, 'INFO', 'Project completed', p.name + ' \u2014 every task is approved', 'PROJECT', p.id);
+    if (p.autoInvoiceOnComplete !== false) autoInvoice(p, 'COMPLETE');
+  }
+
   var DataAPI = {
 
     /* ── lifecycle ─────────────────────────────────────────────────────── */
     init: function () {
       DB = load();
       _invCounter = null;
+      /* projects whose every task is already approved are completed
+         (status only — no invoice is made for old projects here) */
+      (DB.projects || []).forEach(function (p) {
+        if (p.status !== 'ACTIVE') return;
+        var ds = (DB.deliverables || []).filter(function (d) { return d.projectId === p.id; });
+        if (ds.length && ds.every(function (d) { return d.status === 'DONE'; })) {
+          p.status = 'COMPLETED'; p.completedAt = p.completedAt || new Date().toISOString();
+        }
+      });
       return ok(true);
     },
     flush: flush,
@@ -442,13 +521,19 @@
       var proj = S.Shape.project(Object.assign({ id: maxId + 1 }, payload));
       DB.projects.push(proj);
       logActivity('\uD83D\uDCC1', '#EFF6FF', 'Project <strong>' + U.esc(proj.name) + '</strong> created for ' + U.esc(proj.clientName));
+      if (proj.autoInvoiceOnCreate) autoInvoice(proj, 'CREATE');
       return ok(clone(proj));
     },
     updateProject: function (id, patch) {
       var p = findOr404(DB.projects, id);
       if (!p) return fail('Project not found', 'NOT_FOUND');
+      var wasDone = p.status === 'COMPLETED';
       Object.assign(p, patch || {});
       if (patch && patch.status) p.status = S.normProjectStatus(patch.status);
+      if (!wasDone && p.status === 'COMPLETED') {
+        p.completedAt = p.completedAt || new Date().toISOString();
+        if (p.autoInvoiceOnComplete !== false) autoInvoice(p, 'COMPLETE');
+      }
       return ok(clone(p));
     },
     deleteProject: function (id) {
@@ -581,7 +666,10 @@
         : null;
       var seeded = Object.assign({}, payload);
       if (milestone) {
-        if (seeded.pricePaise == null && milestone.amountPaise > 0) seeded.pricePaise = milestone.amountPaise;
+        /* the milestone amount is SHARED by its tasks (it used to be given in
+           full to every task, so two tasks cost twice the milestone) */
+        var msPriced = milestone.amountPaise > 0 && seeded.pricePaise == null;
+        if (msPriced) seeded.priceFromMilestone = true;
         if (seeded.estimateHours == null && seeded.estimateSecs == null && milestone.estimatedHours > 0) seeded.estimateHours = milestone.estimatedHours;
         if (seeded.pricingMode == null && milestone.amountPaise > 0) seeded.pricingMode = 'PIECE';
         if (!seeded.slab && milestone.amountPaise > 0) {
@@ -594,7 +682,9 @@
         }
       }
       var maxId = DB.deliverables.reduce(function (m, x) { return Math.max(m, Number(x.id) || 0); }, 5000);
+      if (seeded.priceFromMilestone) seeded.pricePaise = 0;           // set just below, after the task exists
       var del = S.Shape.deliverable(Object.assign({ id: maxId + 1, createdAt: new Date().toISOString() }, seeded));
+      del.priceFromMilestone = !!seeded.priceFromMilestone;
       if (!del.timeline.length) {
         var names = del.assigneeIds.map(function (i) {
           var e = findOr404(DB.employees, i); return e ? e.name : '?';
@@ -602,6 +692,7 @@
         del.timeline.push({ type: 'assign', text: 'Assigned to ' + names, time: new Date().toISOString() });
       }
       DB.deliverables.push(del);
+      if (del.priceFromMilestone && milestone) splitMilestoneAmount(milestone);
       /* Piece-rate fields + estimate agreement (shared/wallet.js) */
       if (root.Wallet) root.Wallet.onDeliverableCreated(del, seeded);
       var isPiece = del.pricingMode === 'PIECE' && del.pricePaise > 0;
@@ -701,6 +792,7 @@
           }
         }
       }
+      autoCompleteProject(d.projectId);
       return ok(clone(d));
     },
 

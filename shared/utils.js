@@ -1,4 +1,3 @@
-
 (function (root) {
   'use strict';
 
@@ -166,6 +165,27 @@
 
 
   var _idSeq = 0;
+
+  /* Money received from a client for one project (with GST), optionally up to
+     a date. Advance + invoice payments, but never more than what was billed
+     (or the project value): many people record the full invoice as paid even
+     though part of it was the advance — that must not be counted twice.
+     Payments marked "Advance" are the advance itself being adjusted. */
+  function clientReceivedPaise(p, invoices, asOfIso) {
+    var asOf = asOfIso || '9999-12-31';
+    var inv = (invoices || []).filter(function (i) { return i.projectId === p.id && i.status !== 'CANCELLED'; });
+    var paid = 0, billed = 0;
+    inv.forEach(function (i) {
+      if (i.status !== 'DRAFT' && String(i.issueDate || '') <= asOf) billed += i.totalPaise || 0;
+      var pays = i.payments || [];
+      if (pays.length) pays.forEach(function (x) { if (x.method !== 'Advance' && String(x.date || '') <= asOf) paid += x.amountPaise || 0; });
+      else if (!asOfIso) paid += i.paidPaise || 0;
+    });
+    var adv = p.advancePaidPaise && String(p.advanceDate || '0000') <= asOf ? p.advancePaidPaise : 0;
+    var cap = Math.max(billed, p.contractValuePaise || p.budgetPaise || 0, adv);
+    return Math.min(adv + paid, cap);
+  }
+
   function newId(prefix) {
     _idSeq += 1;
     return (prefix ? prefix + '_' : '') + Date.now().toString(36) + '_' +
@@ -228,6 +248,7 @@
       return u;
     },
 
+    clientReceivedPaise: clientReceivedPaise,
     esc: esc, escAttr: escAttr, escJs: escJs, sanitizeHtml: sanitizeHtml,
     InvoiceCounter: InvoiceCounter, financialYearLabel: financialYearLabel,
     computeGst: computeGst,

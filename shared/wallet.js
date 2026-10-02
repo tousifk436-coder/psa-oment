@@ -25,6 +25,7 @@
   /* ── Ensure collections + policy ─────────────────────────────────────── */
   function ensure() {
     var DB = DataAPI.raw();
+    repairDirectPayments(DB);
     if (!DB) return null;
     if (!DB.walletEntries) DB.walletEntries = [];
     if (!DB.disputes)      DB.disputes = [];
@@ -32,7 +33,7 @@
     if (!DB.payPolicy) DB.payPolicy = {
       wipLimit: 2,                  
       slabStepSecs: 3600,           
-      slabCutPct: 6,               // har slab pe price ka itna % kam (₹500 -> ₹30)
+      slabCutPct: 6,               // % taken off the price for each slab (₹500 → ₹30)
       floorPct: 65,                 
       graceSecs: 0,                 
       autoAgreeBelowPaise: 20000,  // ₹200 se chhote tasks — admin ka estimate default accept
@@ -77,6 +78,17 @@
   function now() { return new Date().toISOString(); }
   function del(DB, id) { return DB.deliverables.find(function (d) { return String(d.id) === String(id); }); }
   function emp(DB, id) { return DB.employees.find(function (e) { return String(e.id) === String(id); }); }
+  function repairDirectPayments(DB) {
+    if (!DB.walletEntries) return;
+    var cancelled = {};
+    DB.walletEntries.forEach(function (x) { if (x.meta && x.meta.cancels) cancelled[x.meta.cancels] = 1; if (x.meta && x.meta.reversalOf) cancelled[x.meta.reversalOf] = 1; });
+    DB.walletEntries.filter(function (x) { return x.type === 'BONUS' && x.meta && x.meta.direct && !cancelled[x.id]; }).forEach(function (x) {
+      DB.walletEntries.unshift({ id: U.newId('w'), employeeId: x.employeeId, deliverableId: null, projectId: x.projectId || null, type: 'ADJUSTMENT',
+        amountPaise: -x.amountPaise, why: 'Correction: a payment is not earnings', createdAt: new Date().toISOString(),
+        meta: { manual: true, cancels: x.id, system: true } });
+    });
+  }
+
   function empName(DB, id) { var e = emp(DB, id); return e ? e.name : (id === DB.adminUser.id ? DB.adminUser.name : 'Unknown'); }
   function projName(DB, id) { var p = DB.projects.find(function (x) { return x.id === id; }); return p ? p.name : '\u2014'; }
   function rupee(paise) { return U.fmtRupee(paise).replace('.00', ''); }
@@ -543,20 +555,19 @@
                       earned + paid, so their balance doesn't change but the
                       project's spend does. */
     recordEmployeePayment: function (employeeId, p) {
+      /* A payment only reduces what is owed ("still to pay"). It is never
+         counted as earnings. Paying more than is owed is allowed and shows as
+         an advance. */
       p = p || {};
       var amt = Math.round(Math.abs(Number(p.amountPaise) || 0));
       if (!amt) return fail('Enter the amount paid', 'VALIDATION');
       var date = p.date && /^\d{4}-\d{2}-\d{2}$/.test(p.date) ? p.date : U.isoDate(new Date());
       if (date > U.isoDate(new Date())) return fail('The date cannot be in the future', 'VALIDATION');
       var proj = p.projectId != null && p.projectId !== '' ? ensure().projects.find(function (x) { return x.id === Number(p.projectId); }) : null;
-      var label = String(p.note || '').trim() || (p.mode === 'DIRECT' ? 'Payment' : 'Payout');
-      var why = label + (proj ? ' \u2014 ' + proj.name : '') + (p.method ? ' (' + p.method + (p.reference ? ', ref ' + p.reference : '') + ')' : '');
-      var meta = { projectId: proj ? proj.id : null, method: p.method || null, reference: p.reference || null, date: date, direct: p.mode === 'DIRECT' };
-      var self = this;
-      var first = p.mode === 'DIRECT'
-        ? self.addEntry(employeeId, 'BONUS', amt, why, meta)
-        : Promise.resolve(null);
-      return first.then(function () { return self.addEntry(employeeId, 'PAYOUT', -amt, why, meta); });
+      var why = (String(p.note || '').trim() || 'Payment') + (proj ? ' \u2014 ' + proj.name : '') +
+        (p.method ? ' (' + p.method + (p.reference ? ', ref ' + p.reference : '') + ')' : '');
+      return this.addEntry(employeeId, 'PAYOUT', -amt, why,
+        { projectId: proj ? proj.id : null, method: p.method || null, reference: p.reference || null, date: date, direct: true });
     },
 
     /* Undo a payment that was recorded by mistake. The ledger is never
@@ -565,10 +576,14 @@
     reversePayment: function (entryId, reason) {
       var DB = ensure();
       var w = DB.walletEntries.find(function (x) { return String(x.id) === String(entryId); });
-      if (!w || w.type !== 'PAYOUT') return fail('Payment not found', 'NOT_FOUND');
+      if (!w) return fail('Entry not found', 'NOT_FOUND');
+      if (w.type === 'TASK_CREDIT' || w.type === 'SLAB_ADJUSTMENT' || w.type === 'DISPUTE_CREDIT')
+        return fail('Task pay comes from the task itself \u2014 return or re-price the task instead', 'INVALID_STATE');
+      if (w.meta && w.meta.reversalOf) return fail('This is already a correction', 'INVALID_STATE');
       if (DB.walletEntries.some(function (x) { return x.meta && String(x.meta.reversalOf) === String(w.id); }))
         return fail('This payment was already undone', 'INVALID_STATE');
-      var why = 'Payment undone' + (reason ? ': ' + String(reason).trim() : '') + ' (was ' + rupee(-w.amountPaise) + ')';
+      var why = (w.type === 'PAYOUT' ? 'Payment undone' : 'Credit undone') + (reason ? ': ' + String(reason).trim() : '') +
+        ' (was ' + rupee(Math.abs(w.amountPaise)) + ')';
       var made = [];
       var add = function (amt, of) {
         var e = { id: U.newId('w'), employeeId: w.employeeId, deliverableId: null, projectId: w.projectId || null, type: 'ADJUSTMENT',
@@ -583,7 +598,7 @@
         });
         if (pair) add(-pair.amountPaise, pair.id);
       }
-      activity(DB, '\u21A9\uFE0F', '#FEF2F2', 'Payment of ' + rupee(-w.amountPaise) + ' to <strong>' + U.esc(empName(DB, w.employeeId)) + '</strong> undone');
+      activity(DB, '\u21A9\uFE0F', '#FEF2F2', (w.type === 'PAYOUT' ? 'Payment of ' : 'Credit of ') + rupee(Math.abs(w.amountPaise)) + ' for <strong>' + U.esc(empName(DB, w.employeeId)) + '</strong> undone');
       return ok(clone(made));
     },
 
