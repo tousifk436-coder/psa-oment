@@ -1232,13 +1232,26 @@
     /* withId given → only that employee's chat (the employee app uses this) */
     getConversations: function (withId) {
       if (withId == null) return list(DB.conversations);
-      return list(DB.conversations.filter(function (c) { return Number(c.withId) === Number(withId); }));
+      return list(DB.conversations.filter(function (c) {
+        return Number(c.withId) === Number(withId) || (c.participantIds || []).indexOf(Number(withId)) >= 0;
+      }));
     },
     sendMessage: function (conversationId, fromId, text) {
       var c = findOr404(DB.conversations, conversationId);
       if (!c) return fail('Conversation not found', 'NOT_FOUND');
       if (!String(text || '').trim()) return fail('Message cannot be empty', 'VALIDATION');
       c.msgs.push({ fromId: fromId, text: String(text).trim(), at: new Date().toISOString() });
+      /* employee ↔ employee chat: the other person gets the unread + notification */
+      if (c.kind === 'PEER') {
+        var other = (c.participantIds || []).find(function (x) { return Number(x) !== Number(fromId); });
+        var sender = DB.employees.find(function (e) { return e.id === Number(fromId); });
+        c.unreadBy = c.unreadBy || {};
+        if (other != null) {
+          c.unreadBy[other] = (c.unreadBy[other] || 0) + 1;
+          notify(Number(other), 'MESSAGE', 'New message from ' + (sender ? sender.name : 'a colleague'), String(text).trim().slice(0, 120), 'CONVERSATION', c.id);
+        }
+        return ok(clone(c));
+      }
       /* unread = for the admin, empUnread = for the employee */
       var fromAdmin = Number(fromId) === Number(DB.adminUser.id);
       var preview = String(text).trim().slice(0, 120);
@@ -1263,9 +1276,27 @@
       }
       return ok(clone(c));
     },
-    /* side: 'EMPLOYEE' clears the employee's unread count, otherwise the admin's */
+    /* Employee ↔ employee chat (any department): reuse or start one */
+    startPeerConversation: function (meId, otherId) {
+      var a = Number(meId), b = Number(otherId);
+      if (a === b) return fail('Pick a colleague, not yourself', 'VALIDATION');
+      var me = DB.employees.find(function (e) { return e.id === a; });
+      var other = DB.employees.find(function (e) { return e.id === b && e.active !== false; });
+      if (!me || !other) return fail('Employee not found', 'NOT_FOUND');
+      var c = DB.conversations.find(function (x) {
+        return x.kind === 'PEER' && (x.participantIds || []).indexOf(a) >= 0 && (x.participantIds || []).indexOf(b) >= 0;
+      });
+      if (!c) {
+        c = { id: U.newId('conv'), kind: 'PEER', participantIds: [a, b], unreadBy: {}, msgs: [] };
+        DB.conversations.unshift(c);
+      }
+      return ok(clone(c));
+    },
+    /* side: 'EMPLOYEE' clears the employee's unread count, otherwise the admin's;
+       in an employee ↔ employee chat, side is the reader's id */
     markConversationRead: function (conversationId, side) {
       var c = findOr404(DB.conversations, conversationId);
+      if (c && c.kind === 'PEER') { c.unreadBy = c.unreadBy || {}; if (side != null) c.unreadBy[Number(side)] = 0; return ok(clone(c)); }
       if (c) { if (side === 'EMPLOYEE') c.empUnread = 0; else c.unread = 0; }
       return ok(c ? clone(c) : null);
     },

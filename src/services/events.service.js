@@ -313,7 +313,8 @@ function explicit(ctx, D, mark, { api, method, args, result }) {
       const c = (D.conversations || []).find(x => String(x.id) === String(A[0]));
       if (!c) break;
       const fromId = Number(A[1]);
-      const to = email.isAdminId(fromId) ? email.person(c.withId) : adminP;
+      const peerTo = c.kind === 'PEER' ? (c.participantIds || []).find(x => Number(x) !== fromId) : null;
+      const to = c.kind === 'PEER' ? email.person(peerTo) : email.isAdminId(fromId) ? email.person(c.withId) : adminP;
       const from = email.person(fromId);
       const k = String(c.id) + '>' + (to && to.email);
       if (!to || (Date.now() - (lastMsgMail.get(k) || 0)) < MSG_THROTTLE_MS) break;
