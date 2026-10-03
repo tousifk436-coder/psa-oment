@@ -19,7 +19,7 @@ const env = require('../config/env');
 const logger = require('../utils/logger');
 
 const SHARED = path.join(__dirname, '..', '..', 'shared');
-const FILES = ['utils.js', 'schema.js', 'seed.js', 'data.js', 'wallet.js', 'hrm.js', 'profitability.js', 'een-signals.js', 'integrations/crm.js'];
+const FILES = ['utils.js', 'schema.js', 'seed.js', 'data.js', 'wallet.js', 'penalties.js', 'hrm.js', 'profitability.js', 'een-signals.js', 'integrations/crm.js'];
 const STORAGE_KEY = 'oment_psa_db_v2';
 
 /* Lists emptied when starting a real company with no demo data */

@@ -35,7 +35,9 @@ function err(code, message) { return new ApiError(code, message); }
 /* throws unless this conversation belongs to the signed-in employee */
 function ownConversation(user, conversationId) {
   const c = (engine.get().DataAPI.raw().conversations || []).find(x => String(x.id) === String(conversationId));
-  if (!c || Number(c.withId) !== Number(user.empId)) throw new ApiError('FORBIDDEN', 'Not your conversation');
+  const mine = c && (Number(c.withId) === Number(user.empId) || (c.participantIds || []).map(Number).includes(Number(user.empId)));
+  if (!mine) throw new ApiError('FORBIDDEN', 'Not your conversation');
+  return c;
 }
 const FORBID = () => err('FORBIDDEN', 'You can only access your own data');
 
@@ -129,10 +131,15 @@ const GUARDS = {
       return args;
     },
     markConversationRead: (user, args) => {
-      if (user.role !== 'ADMIN') { ownConversation(user, args[0]); args[1] = 'EMPLOYEE'; }
+      if (user.role !== 'ADMIN') { const c = ownConversation(user, args[0]); args[1] = c.kind === 'PEER' ? user.empId : 'EMPLOYEE'; }
       return args;
     },
     startConversation: (user, args) => { if (user.role !== 'ADMIN') args[0] = user.empId; return args; },
+    /* employee ↔ employee chat: always as yourself */
+    startPeerConversation: (user, args) => {
+      if (user.role === 'ADMIN') throw new ApiError('FORBIDDEN', 'Admins use the normal chat');
+      args[0] = user.empId; return args;
+    },
 
     getCalendarEvents: 'any', createCalendarEvent: 'admin', deleteCalendarEvent: 'admin',
 
@@ -184,6 +191,10 @@ const GUARDS = {
     getBlocked: 'admin',
     getWallet: moneyGated(selfArg(0)), getLedger: moneyGated((user, args) => { if (user.role !== 'ADMIN') args[0] = Object.assign({}, args[0], { employeeId: user.empId }); return args; }),
     addEntry: 'admin', recordEmployeePayment: 'admin', reversePayment: 'admin',
+    applyPenalty: 'admin', getPenaltyRecords: (user, args) => { if (user.role !== 'ADMIN') args[0] = Object.assign({}, args[0] || {}, { employeeId: user.empId }); return args; },
+    raisePenaltyAppeal: (user, args) => { if (user.role !== 'ADMIN') args[1] = user.empId; return args; },
+    resolvePenaltyAppeal: 'admin',
+    getPenaltyAppeals: (user, args) => { if (user.role !== 'ADMIN') args[0] = Object.assign({}, args[0] || {}, { employeeId: user.empId }); return args; },
     raiseDispute: moneyGated((user, args) => { if (user.role !== 'ADMIN') args[1] = user.empId; return args; }),
     resolveDispute: 'admin',
     getDisputes: moneyGated((user, args) => { if (user.role !== 'ADMIN') args[0] = Object.assign({}, args[0], { employeeId: user.empId }); return args; }),
