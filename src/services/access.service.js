@@ -35,7 +35,9 @@ function err(code, message) { return new ApiError(code, message); }
 /* throws unless this conversation belongs to the signed-in employee */
 function ownConversation(user, conversationId) {
   const c = (engine.get().DataAPI.raw().conversations || []).find(x => String(x.id) === String(conversationId));
-  if (!c || Number(c.withId) !== Number(user.empId)) throw new ApiError('FORBIDDEN', 'Not your conversation');
+  const mine = c && (Number(c.withId) === Number(user.empId) || (c.participantIds || []).map(Number).includes(Number(user.empId)));
+  if (!mine) throw new ApiError('FORBIDDEN', 'Not your conversation');
+  return c;
 }
 const FORBID = () => err('FORBIDDEN', 'You can only access your own data');
 
@@ -57,6 +59,49 @@ const assigneeArg = i => (user, args) => {
 const selfPayload = (field, i) => (user, args) => {
   if (user.role === 'ADMIN') return args;
   args[i] = Object.assign({}, args[i], { [field]: user.empId });
+  return args;
+};
+
+/* Employee-created subtasks are always their own review items. */
+const selfSubtaskCreate = (user, args) => {
+  if (user.role === 'ADMIN') return args;
+  const p = Object.assign({}, args[0] || {});
+  const DB = engine.get().DataAPI.raw();
+  const d = (DB.deliverables || []).find(x => String(x.id) === String(p.deliverableId));
+  if (!d || (d.assigneeIds || []).map(Number).indexOf(Number(user.empId)) < 0) throw FORBID();
+  p.assigneeId = user.empId;
+  p.createdById = user.empId;
+  p.origin = 'SELF';
+  p.status = 'IN_REVIEW';
+  p.approvalState = 'PENDING';
+  args[0] = p;
+  return args;
+};
+
+const selfSubtaskUpdate = (user, args) => {
+  if (user.role === 'ADMIN') return args;
+  const DB = engine.get().DataAPI.raw();
+  const s = (DB.subtasks || []).find(x => String(x.id) === String(args[0]));
+  if (!s || (Number(s.assigneeId) !== Number(user.empId) && Number(s.createdById) !== Number(user.empId))) throw FORBID();
+  const patch = Object.assign({}, args[1] || {});
+  const allowed = ['status', 'description', 'loggedSecs', 'estimateSecs', 'submissionNotes', 'submissionFiles'];
+  Object.keys(patch).forEach(k => { if (!allowed.includes(k)) delete patch[k]; });
+  if (patch.status) {
+    const status = String(patch.status).toUpperCase();
+    if (status === 'IN_REVIEW' || status === 'SUBMITTED') {
+      patch.status = 'IN_REVIEW';
+      /* First review approves the task to start; a later submission is a
+         completion review. The current stored state tells us which phase. */
+      patch.approvalState = String(s.approvalState || '').toUpperCase() === 'APPROVED'
+        ? 'COMPLETION_PENDING'
+        : 'PENDING';
+      patch.rejectionReason = null;
+    } else if (status === 'IN_PROGRESS' || status === 'REJECTED') {
+      patch.status = 'IN_PROGRESS';
+      if (String(s.approvalState || '').toUpperCase() === 'REJECTED') patch.approvalState = 'PENDING';
+    }
+  }
+  args[1] = patch;
   return args;
 };
 
@@ -102,8 +147,8 @@ const GUARDS = {
     addDeliverableFiles: assigneeArg(0), removeDeliverableFile: assigneeArg(0),
 
     getSubtasks: 'any',
-    createSubtask: selfPayload('assigneeId', 0),
-    updateSubtask: 'any', approveSubtask: 'admin', rejectSubtask: 'admin', deleteSubtask: 'any',
+    createSubtask: selfSubtaskCreate,
+    updateSubtask: selfSubtaskUpdate, approveSubtask: 'admin', rejectSubtask: 'admin', deleteSubtask: 'any',
 
     startTimer: selfArg(0), stopTimer: selfArg(0), getOpenTimer: selfArg(0),
 
@@ -129,10 +174,15 @@ const GUARDS = {
       return args;
     },
     markConversationRead: (user, args) => {
-      if (user.role !== 'ADMIN') { ownConversation(user, args[0]); args[1] = 'EMPLOYEE'; }
+      if (user.role !== 'ADMIN') { const c = ownConversation(user, args[0]); args[1] = c.kind === 'PEER' ? user.empId : 'EMPLOYEE'; }
       return args;
     },
     startConversation: (user, args) => { if (user.role !== 'ADMIN') args[0] = user.empId; return args; },
+    /* employee ↔ employee chat: always as yourself */
+    startPeerConversation: (user, args) => {
+      if (user.role === 'ADMIN') throw new ApiError('FORBIDDEN', 'Admins use the normal chat');
+      args[0] = user.empId; return args;
+    },
 
     getCalendarEvents: 'any', createCalendarEvent: 'admin', deleteCalendarEvent: 'admin',
 
@@ -184,6 +234,10 @@ const GUARDS = {
     getBlocked: 'admin',
     getWallet: moneyGated(selfArg(0)), getLedger: moneyGated((user, args) => { if (user.role !== 'ADMIN') args[0] = Object.assign({}, args[0], { employeeId: user.empId }); return args; }),
     addEntry: 'admin', recordEmployeePayment: 'admin', reversePayment: 'admin',
+    applyPenalty: 'admin', getPenaltyRecords: (user, args) => { if (user.role !== 'ADMIN') args[0] = Object.assign({}, args[0] || {}, { employeeId: user.empId }); return args; },
+    raisePenaltyAppeal: (user, args) => { if (user.role !== 'ADMIN') args[1] = user.empId; return args; },
+    resolvePenaltyAppeal: 'admin',
+    getPenaltyAppeals: (user, args) => { if (user.role !== 'ADMIN') args[0] = Object.assign({}, args[0] || {}, { employeeId: user.empId }); return args; },
     raiseDispute: moneyGated((user, args) => { if (user.role !== 'ADMIN') args[1] = user.empId; return args; }),
     resolveDispute: 'admin',
     getDisputes: moneyGated((user, args) => { if (user.role !== 'ADMIN') args[0] = Object.assign({}, args[0], { employeeId: user.empId }); return args; }),

@@ -9,6 +9,7 @@
     DISPUTE_CREDIT:    { key:'DISPUTE_CREDIT',    label:'Dispute credit',     sign: +1 },
     BONUS:             { key:'BONUS',             label:'Bonus',              sign: +1 },
     ADJUSTMENT:        { key:'ADJUSTMENT',        label:'Manual adjustment',  sign:  0 },
+    DEDUCTION:         { key:'DEDUCTION',         label:'Penalty deduction',  sign: -1 },
     PAYOUT:            { key:'PAYOUT',            label:'Payout',             sign: -1 }
   };
 
@@ -459,6 +460,7 @@
         employeeId: eid, balancePaise: balance,
         earnedPaise: sum('TASK_CREDIT') + sum('BONUS') + sum('DISPUTE_CREDIT'),
         slabPaise: sum('SLAB_ADJUSTMENT'), paidOutPaise: -sum('PAYOUT'), adjustmentsPaise: sum('ADJUSTMENT'),
+        deductionsPaise: -sum('DEDUCTION'),
         thisMonthPaise: thisMonth, committedPaise: committed, openDisputes: open.length,
         entries: entries.map(function (w) { return Object.assign(clone(w), {
           disputeStatus: disputedIds[w.id] || null,
@@ -535,16 +537,29 @@
         if (!meta.direct && -amountPaise > bal) return fail('That is more than the balance due (' + rupee(bal) + '). Choose "Direct payment" for salary, advances or project fees.', 'VALIDATION');
       }
       if (type === 'BONUS' || type === 'DISPUTE_CREDIT') amountPaise = Math.abs(amountPaise);
+      if (type === 'DEDUCTION') amountPaise = -Math.abs(amountPaise);
       var w = { id: U.newId('w'), employeeId: Number(employeeId), deliverableId: null,
         projectId: meta.projectId != null && meta.projectId !== '' ? Number(meta.projectId) : null, type: type,
         amountPaise: amountPaise, why: String(why).trim(), createdAt: now(),
         meta: { manual: true, byId: DB.adminUser.id, method: meta.method || null, reference: meta.reference || null,
-                date: meta.date || null, direct: !!meta.direct } };
+                date: meta.date || null, direct: !!meta.direct, penalty: meta.penalty || null } };
       DB.walletEntries.unshift(w);
       notify(DB, Number(employeeId), amountPaise > 0 ? 'APPROVED' : 'INFO', ENTRY_TYPES[type].label + ': ' + rupee(Math.abs(amountPaise)), w.why, 'WALLET', w.id);
       if (type === 'PAYOUT') {
         var e = emp(DB, employeeId);
         if (e) queueEmail(DB, e.email, 'Oment: payout of ' + rupee(-amountPaise), 'Hi ' + e.name.split(' ')[0] + ',\n\n' + rupee(-amountPaise) + ' paid out. ' + w.why + '\n\n\u2014 Oment', 'PAYOUT', { employeeId: e.id, amountPaise: -amountPaise });
+      }
+      if (type === 'DEDUCTION') {
+        var de = emp(DB, employeeId);
+        var pm = w.meta && w.meta.penalty ? w.meta.penalty : {};
+        if (de) queueEmail(DB, de.email, 'Oment: penalty deduction of ' + rupee(Math.abs(amountPaise)),
+          'Hi ' + de.name.split(' ')[0] + ',\n\nA penalty deduction has been recorded in your Oment payout.\n\n' +
+          'Penalty: ' + (pm.ruleName || 'Penalty') + '\n' +
+          'Date: ' + (pm.date || w.createdAt.slice(0, 10)) + '\n' +
+          'Penalty days: ' + (pm.penaltyDays != null ? pm.penaltyDays : '—') + '\n' +
+          'Deduction: ' + rupee(Math.abs(amountPaise)) + '\n' +
+          'Reason: ' + w.why + '\n\nYour payout balance has been updated accordingly.\n\n— Oment',
+          'PENALTY', { employeeId: de.id, amountPaise: Math.abs(amountPaise), penalty: pm });
       }
       return ok(clone(w));
     },
@@ -609,6 +624,7 @@
       var earned = sum(function (w) { return w.type === 'TASK_CREDIT' || w.type === 'BONUS' || w.type === 'DISPUTE_CREDIT'; });
       var slab = sum(function (w) { return w.type === 'SLAB_ADJUSTMENT'; });
       var adj = sum(function (w) { return w.type === 'ADJUSTMENT'; });
+      var deductions = -sum(function (w) { return w.type === 'DEDUCTION'; });
       var paid = -sum(function (w) { return w.type === 'PAYOUT'; });
       var open = DB.deliverables.filter(function (d) { return isPiece(d) && d.status !== 'DONE'; });
       var committed = open.reduce(function (s, d) { return s + (d.pricePaise || 0); }, 0);
@@ -627,7 +643,7 @@
         var avgRatio = ratioList.length ? ratioList.reduce(function (a, b) { return a + b; }, 0) / ratioList.length : null;
         return { id: e.id, name: e.name, avatarInitials: e.avatarInitials, avatarBg: e.avatarBg, avatarFg: e.avatarFg,
           earnedPaise: s('TASK_CREDIT') + s('BONUS') + s('DISPUTE_CREDIT'), slabPaise: s('SLAB_ADJUSTMENT'),
-          paidOutPaise: -s('PAYOUT'), balancePaise: mine.reduce(function (a, w) { return a + w.amountPaise; }, 0),
+          deductionsPaise: -s('DEDUCTION'), paidOutPaise: -s('PAYOUT'), balancePaise: mine.reduce(function (a, w) { return a + w.amountPaise; }, 0),
           tasksDone: pieceDone.length, onTime: onTime, avgRatio: avgRatio != null ? Math.round(avgRatio * 100) / 100 : null,
           reworks: pieceDone.reduce(function (a, d) { return a + (d.reworkCount || 0); }, 0),
           openTasks: open.filter(function (d) { return (d.assigneeIds || []).indexOf(e.id) >= 0; }).length,
@@ -645,8 +661,8 @@
       }).filter(Boolean);
 
       return Promise.resolve({
-        earnedPaise: earned, slabPaise: slab, adjustmentsPaise: adj, paidOutPaise: paid,
-        liabilityPaise: earned + slab + adj - paid,           
+        earnedPaise: earned, slabPaise: slab, adjustmentsPaise: adj, deductionsPaise: deductions, paidOutPaise: paid,
+        liabilityPaise: earned + slab + adj - deductions - paid,           
         committedPaise: committed,                            // open tasks — if done in sab time pe hue
         thisMonthPaise: thisMonth,
         openTasks: open.length, blockedTasks: blocked, pendingAgreement: pendingAgreement,

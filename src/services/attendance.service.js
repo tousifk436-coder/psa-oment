@@ -5,7 +5,7 @@
    idle, and time per task. It sends those totals here:
 
      heartbeat()  every ~15s while the app is open   → keeps today's record live
-     punchOut()   when the employee logs out          → logout time + half-day
+     punchOut()   when the employee logs out          → closes the current session
 
    Totals only ever go UP (max of stored vs sent), so two open tabs or a late
    request can never shrink someone's recorded time. Stored on the same
@@ -16,7 +16,6 @@ const engine = require('./engine.service');
 const ApiError = require('../utils/ApiError');
 
 const DAY = 86400;
-const HALF_DAY_SECS = 4 * 3600;
 const ONLINE_WINDOW_MS = 2 * 60 * 1000;
 
 const clampSecs = v => Math.max(0, Math.min(DAY, Math.round(Number(v) || 0)));
@@ -33,11 +32,19 @@ function recordFor(empId, date) {
   let a = (D.attendance || []).find(x => x.employeeId === emp.id && x.date === date);
   if (!a) {
     a = ctx.Schema.Shape.attendanceDay({
-      id: 'att_' + emp.id + '_' + date, employeeId: emp.id, date, status: 'PRESENT', firstInAt: new Date().toISOString()
+      id: 'att_' + emp.id + '_' + date, employeeId: emp.id, date, status: 'PRESENT', firstInAt: new Date().toISOString(), sessions: [{ inAt: new Date().toISOString(), outAt: null }]
     });
     D.attendance.unshift(a);
   }
+  if (!Array.isArray(a.sessions)) a.sessions = [];
+  if (!a.sessions.length && a.firstInAt) a.sessions.push({ inAt: a.firstInAt, outAt: a.lastOutAt || null });
   return a;
+}
+
+function ensureOpenSession(a, at) {
+  if (!Array.isArray(a.sessions)) a.sessions = [];
+  var last = a.sessions[a.sessions.length - 1];
+  if (!last || last.outAt) a.sessions.push({ inAt: at, outAt: null });
 }
 
 function merge(a, body) {
@@ -54,8 +61,8 @@ function merge(a, body) {
   }
   if (!a.firstInAt) a.firstInAt = new Date().toISOString();
   if (body.lateReason) a.lateReason = String(body.lateReason).trim().slice(0, 300);
-  /* working right now → present. "Half day" is decided only at log-out, so
-     logging in again the same day clears an earlier half-day mark. */
+  /* Working right now means PRESENT. A genuine Half Day is an explicit HR
+     attendance decision, not a side effect of a normal login/logout session. */
   if (!a.status || a.status === 'ABSENT' || (a.status === 'HALF_DAY' && !a.lastOutAt)) a.status = 'PRESENT';
   a.lastSeenAt = new Date().toISOString();
   if (body.onBreak !== undefined) a.onBreak = !!body.onBreak;
@@ -65,7 +72,15 @@ function merge(a, body) {
 /* call inside a unit of work */
 function heartbeat(empId, body) {
   const a = recordFor(empId, todayISO());
-  if (a.lastOutAt && body && body.resume) a.lastOutAt = null;   // logged in again the same day
+  const wasOut = !!a.lastOutAt;
+  const at = new Date().toISOString();
+  if (body && body.resume) {
+    if (wasOut) a.lastOutAt = null;
+    ensureOpenSession(a, at);
+    a.status = 'PRESENT';
+  } else if (!a.lastOutAt) {
+    ensureOpenSession(a, a.firstInAt || at);
+  }
   merge(a, body);
   engine.get().DataAPI.touch();
   return JSON.parse(JSON.stringify(a));
@@ -75,10 +90,21 @@ function heartbeat(empId, body) {
 function punchOut(empId, body) {
   const a = recordFor(empId, todayISO());
   merge(a, body);
-  a.lastOutAt = new Date().toISOString();
+  const outAt = new Date().toISOString();
+  a.lastOutAt = outAt;
   a.onBreak = false;
   a.currentDeliverableId = null;
-  if ((a.activeSecs || 0) > 0 && a.activeSecs < HALF_DAY_SECS && a.status === 'PRESENT') a.status = 'HALF_DAY';
+  if (!Array.isArray(a.sessions)) a.sessions = [];
+  var last = a.sessions[a.sessions.length - 1];
+  if (!last || last.outAt) {
+    a.sessions.push({ inAt: a.firstInAt || outAt, outAt: outAt });
+  } else {
+    last.outAt = outAt;
+  }
+  /* Logging out closes the current session; it is not a half-day decision.
+     Keep the day PRESENT so a normal logout/re-login never changes attendance
+     to Half Day. HR can explicitly mark a genuine Half Day. */
+  if (!a.status || a.status === 'ABSENT') a.status = 'PRESENT';
   /* close any running timer so logged time stops */
   const ctx = engine.get();
   const open = (ctx.DataAPI.raw().timeEntries || []).find(t => t.employeeId === Number(empId) && !t.endedAt);

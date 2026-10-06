@@ -7,6 +7,7 @@ const { num } = require("../utils/parse");
 exports.startTimer = run("DataAPI", "startTimer", (req) => [
   num(req.body.employeeId),
   num(req.body.deliverableId),
+  req.body.subtaskId == null ? null : num(req.body.subtaskId),
 ]);
 exports.stopTimer = run("DataAPI", "stopTimer", (req) => [
   num(req.body.employeeId),

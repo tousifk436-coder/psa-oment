@@ -784,6 +784,24 @@
             ? o.createdById
             : null,
 
+        origin:
+          o.origin || 'ADMIN',
+
+        approvalState:
+          o.approvalState || null,
+
+        rejectionReason:
+          o.rejectionReason || null,
+
+        createdAt:
+          o.createdAt || null,
+
+        completedAt:
+          o.completedAt || null,
+
+        timeline:
+          o.timeline || [],
+
         estimateSecs:
           o.estimateSecs || 0,
 
@@ -846,7 +864,10 @@
           o.breaks || [],
 
         perDeliverableSecs:
-          o.perDeliverableSecs || {}
+          o.perDeliverableSecs || {},
+
+        sessions:
+          o.sessions || []
       };
     },
 
@@ -1408,6 +1429,12 @@
 
         createdById:
           s.createdBy,
+
+        origin:
+          s.origin || (s.createdBy === s.assignee ? 'SELF' : 'ADMIN'),
+
+        approvalState:
+          s.approvalState || null,
 
         estimateSecs:
           TIME.hoursToSecs(

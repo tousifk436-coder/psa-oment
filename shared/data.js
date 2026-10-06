@@ -859,14 +859,47 @@
     createSubtask: function (payload) {
       if (!payload || !payload.title) return fail('Task title is required', 'VALIDATION');
       if (payload.deliverableId == null) return fail('Deliverable is required', 'VALIDATION');
+      var d = findOr404(DB.deliverables, payload.deliverableId);
+      if (!d) return fail('Deliverable not found', 'NOT_FOUND');
       var maxId = DB.subtasks.reduce(function (m, x) { return Math.max(m, Number(x.id) || 0); }, 6000);
-      var st = S.Shape.subtask(Object.assign({ id: maxId + 1, createdAt: new Date().toISOString() }, payload));
+      var seeded = Object.assign({ id: maxId + 1, createdAt: new Date().toISOString() }, payload);
+      /* Employee-created/self-assigned subtasks are review items by design.
+         The access layer stamps origin/approval fields, and this server-side
+         rule keeps direct engine calls consistent as well. */
+      if (seeded.origin === 'SELF' || (seeded.createdById != null && seeded.assigneeId != null && Number(seeded.createdById) === Number(seeded.assigneeId))) {
+        seeded.origin = 'SELF';
+        seeded.status = 'IN_REVIEW';
+        seeded.approvalState = 'PENDING';
+      }
+      var st = S.Shape.subtask(seeded);
       DB.subtasks.push(st);
+      if (st.origin === 'SELF') {
+        var creator = DB.employees.find(function (e) { return Number(e.id) === Number(st.createdById); });
+        notify(DB.adminUser.id, 'REVIEW', 'Self-assigned task pending approval',
+          (creator ? creator.name : 'Employee') + ' created "' + st.title + '" under deliverable ' + (d.title || '—') + '.',
+          'SUBTASK', st.id);
+        logActivity('📝', '#F5F3FF', '<strong>' + U.esc(creator ? creator.name : 'Employee') + '</strong> created self-task <strong>' + U.esc(st.title) + '</strong> for review');
+      } else if (st.assigneeId != null && st.assigneeId !== st.createdById) {
+        notify(st.assigneeId, 'ASSIGNED', 'Task assigned to you', '"' + st.title + '" under ' + (d.title || 'deliverable'), 'SUBTASK', st.id);
+      }
       return ok(clone(st));
     },
     updateSubtask: function (id, patch) {
       var s = findOr404(DB.subtasks, id);
       if (!s) return fail('Task not found', 'NOT_FOUND');
+      /* submitted for review: a timer still running on this task is stopped
+         (and its time saved), exactly like submitting a deliverable */
+      if (patch && /^(IN_REVIEW|SUBMITTED)$/i.test(String(patch.status || ''))) {
+        var openOnIt = DB.timeEntries.find(function (t) { return !t.endedAt && Number(t.subtaskId) === Number(s.id); });
+        if (openOnIt) DataAPI.stopTimer(openOnIt.employeeId);
+        if (!s.timeline) s.timeline = [];
+        var forReview = String(s.approvalState || '').toUpperCase() === 'APPROVED';
+        s.timeline.push({ type: 'submit', text: forReview ? 'Submitted for review' : 'Sent for approval', time: new Date().toISOString() });
+        var who = DB.employees.find(function (e) { return Number(e.id) === Number(s.assigneeId); });
+        var par = DB.deliverables.find(function (x) { return Number(x.id) === Number(s.deliverableId); });
+        notify(DB.adminUser.id, 'REVIEW', forReview ? 'Task submitted for review' : 'Task sent for approval',
+          (who ? who.name : 'Employee') + ' \u2014 "' + s.title + '" under ' + (par ? par.title : 'a deliverable'), 'SUBTASK', s.id);
+      }
       Object.assign(s, patch || {});
       if (patch && patch.status) {
         s.status = S.normStatus(patch.status);
@@ -878,18 +911,31 @@
     approveSubtask: function (id) {
       var s = findOr404(DB.subtasks, id);
       if (!s) return fail('Task not found', 'NOT_FOUND');
-      s.status = 'DONE'; s.approvalState = 'APPROVED'; s.rejectionReason = null;
-      s.completedAt = new Date().toISOString();
-      if (!s.timeline) s.timeline = [];
-      s.timeline.push({ type: 'approve', text: 'Approved by Admin', time: new Date().toISOString() });
-      notify(s.assigneeId, 'APPROVED', 'Task approved', '"' + s.title + '"', 'SUBTASK', s.id);
+      var completionReview = String(s.approvalState || '').toUpperCase() === 'COMPLETION_PENDING';
+      if (completionReview) {
+        s.status = 'DONE'; s.approvalState = 'APPROVED'; s.rejectionReason = null;
+        s.completedAt = s.completedAt || new Date().toISOString();
+        if (!s.timeline) s.timeline = [];
+        s.timeline.push({ type: 'approve', text: 'Completed work approved by Admin', time: new Date().toISOString() });
+        notify(s.assigneeId, 'APPROVED', 'Task completion approved', '"' + s.title + '" is completed and approved.', 'SUBTASK', s.id);
+      } else {
+        /* Initial approval only unlocks the task for work. */
+        s.status = 'TODO'; s.approvalState = 'APPROVED'; s.rejectionReason = null; s.completedAt = null;
+        if (!s.timeline) s.timeline = [];
+        s.timeline.push({ type: 'approve', text: 'Approved by Admin — ready to start', time: new Date().toISOString() });
+        notify(s.assigneeId, 'APPROVED', 'Task approved', '"' + s.title + '" is approved and ready to start.', 'SUBTASK', s.id);
+      }
       return ok(clone(s));
     },
     rejectSubtask: function (id, reason) {
       var s = findOr404(DB.subtasks, id);
       if (!s) return fail('Task not found', 'NOT_FOUND');
       if (!String(reason || '').trim()) return fail('A rejection reason is required', 'VALIDATION');
-      s.status = 'REJECTED'; s.approvalState = 'REJECTED';
+      /* Returned after a completion review: the task stays approved for work,
+         so the employee can start the timer again, fix it and resubmit.
+         Returned at the first review: the task itself was not accepted. */
+      var wasCompletion = String(s.approvalState || '').toUpperCase() === 'COMPLETION_PENDING';
+      s.status = 'REJECTED'; s.approvalState = wasCompletion ? 'APPROVED' : 'REJECTED';
       s.rejectionReason = String(reason).trim(); s.completedAt = null;
       if (!s.timeline) s.timeline = [];
       s.timeline.push({ type: 'reject', text: 'Returned — ' + s.rejectionReason, time: new Date().toISOString() });
@@ -904,29 +950,52 @@
     },
 
     /* ── time tracking ─────────────────────────────────────────────────── */
-    startTimer: function (employeeId, deliverableId) {
+    startTimer: function (employeeId, deliverableId, subtaskId) {
+      var subtask = null;
+      if (subtaskId != null) {
+        subtask = findOr404(DB.subtasks, subtaskId);
+        if (!subtask) return fail('Task not found', 'NOT_FOUND');
+        if (Number(subtask.deliverableId) !== Number(deliverableId)) return fail('Task does not belong to this deliverable', 'VALIDATION');
+        if (Number(subtask.assigneeId) !== Number(employeeId)) return fail('You are not assigned to this task', 'FORBIDDEN');
+        if (String(subtask.approvalState || '').toUpperCase() !== 'APPROVED') return fail('Admin approval is required before you can start this task', 'INVALID_STATE');
+        /* Backward compatibility: older approved subtasks were stored as DONE
+           even though no work had been logged. They are approved-and-ready,
+           not completed, so unlock them on the first Start click. */
+        if (subtask.status === 'DONE' && !(Number(subtask.loggedSecs) > 0)) {
+          subtask.status = 'TODO';
+          subtask.completedAt = null;
+        }
+        if (subtask.status === 'DONE') return fail('This task is already completed', 'INVALID_STATE');
+      }
       if (root.Wallet) {
         var chk = root.Wallet.canStart(employeeId, deliverableId);
         if (!chk.ok) return fail(chk.reason, chk.code);
       }
-      /* Already running on this same task (e.g. the app reopened after a power
-         cut) → keep that timer, don't lose its time. */
       var running = DB.timeEntries.find(function (t) {
-        return t.employeeId === employeeId && !t.endedAt && Number(t.deliverableId) === Number(deliverableId);
+        return t.employeeId === employeeId && !t.endedAt &&
+          Number(t.deliverableId) === Number(deliverableId) &&
+          Number(t.subtaskId || 0) === Number(subtaskId || 0);
       });
       if (running) return ok(clone(running));
-      /* A timer on another task → stop it properly so its time is counted
-         (it used to be closed without adding the time to the task). */
       DataAPI.stopTimer(employeeId);
 
       var entry = S.Shape.timeEntry({
         id: U.newId('te'), employeeId: employeeId, deliverableId: deliverableId,
+        subtaskId: subtaskId != null ? subtaskId : null,
         startedAt: new Date().toISOString(), source: 'TIMER'
       });
       DB.timeEntries.push(entry);
 
       var d = findOr404(DB.deliverables, deliverableId);
-      if (d && d.status === 'TODO') {
+      if (subtask) {
+        if (subtask.status === 'TODO' || subtask.status === 'REJECTED') subtask.status = 'IN_PROGRESS';
+        if (!subtask.timeline) subtask.timeline = [];
+        subtask.timeline.push({ type: 'start', text: 'Started work', time: entry.startedAt });
+        if (d && d.status === 'TODO') {
+          d.status = 'IN_PROGRESS';
+          d.timeline.push({ type: 'start', text: 'Work started from subtask', time: entry.startedAt });
+        }
+      } else if (d && d.status === 'TODO') {
         d.status = 'IN_PROGRESS';
         d.timeline.push({ type: 'start', text: 'Work started', time: entry.startedAt });
       }
@@ -944,6 +1013,10 @@
           if (d.pricingMode === 'PIECE' && root.Wallet && root.Wallet.slabPreview) {
             d.liveSettlement = root.Wallet.slabPreview(d, d.loggedSecs);
           }
+        }
+        if (t.subtaskId != null) {
+          var st = findOr404(DB.subtasks, t.subtaskId);
+          if (st) st.loggedSecs = (st.loggedSecs || 0) + secs;
         }
         var today = U.isoDate(new Date());
         var att = DB.attendance.find(function (a) { return a.employeeId === employeeId && a.date === today; });
@@ -974,14 +1047,19 @@
       var today = U.isoDate(new Date());
       var a = DB.attendance.find(function (x) { return x.employeeId === employeeId && x.date === today; });
       if (!a) {
+        var _in = new Date().toISOString();
         a = S.Shape.attendanceDay({
           id: 'att_' + employeeId + '_' + today, employeeId: employeeId, date: today,
-          status: 'PRESENT', firstInAt: new Date().toISOString(), lastSeenAt: new Date().toISOString()
+          status: 'PRESENT', firstInAt: _in, lastSeenAt: _in, sessions: [{ inAt: _in, outAt: null }]
         });
         DB.attendance.unshift(a);
       } else {
-        if (!a.firstInAt) a.firstInAt = new Date().toISOString();
-        a.lastOutAt = null; a.lastSeenAt = new Date().toISOString(); a.status = 'PRESENT';
+        var _in2 = new Date().toISOString();
+        if (!a.firstInAt) a.firstInAt = _in2;
+        a.lastOutAt = null; a.lastSeenAt = _in2; if (a.status === 'ABSENT' || !a.status) a.status = 'PRESENT';
+        if (!Array.isArray(a.sessions)) a.sessions = [];
+        var _last = a.sessions[a.sessions.length - 1];
+        if (!_last || _last.outAt) a.sessions.push({ inAt: _in2, outAt: null });
       }
       return ok(clone(a));
     },
@@ -1232,13 +1310,26 @@
     /* withId given → only that employee's chat (the employee app uses this) */
     getConversations: function (withId) {
       if (withId == null) return list(DB.conversations);
-      return list(DB.conversations.filter(function (c) { return Number(c.withId) === Number(withId); }));
+      return list(DB.conversations.filter(function (c) {
+        return Number(c.withId) === Number(withId) || (c.participantIds || []).indexOf(Number(withId)) >= 0;
+      }));
     },
     sendMessage: function (conversationId, fromId, text) {
       var c = findOr404(DB.conversations, conversationId);
       if (!c) return fail('Conversation not found', 'NOT_FOUND');
       if (!String(text || '').trim()) return fail('Message cannot be empty', 'VALIDATION');
       c.msgs.push({ fromId: fromId, text: String(text).trim(), at: new Date().toISOString() });
+      /* employee ↔ employee chat: the other person gets the unread + notification */
+      if (c.kind === 'PEER') {
+        var other = (c.participantIds || []).find(function (x) { return Number(x) !== Number(fromId); });
+        var sender = DB.employees.find(function (e) { return e.id === Number(fromId); });
+        c.unreadBy = c.unreadBy || {};
+        if (other != null) {
+          c.unreadBy[other] = (c.unreadBy[other] || 0) + 1;
+          notify(Number(other), 'MESSAGE', 'New message from ' + (sender ? sender.name : 'a colleague'), String(text).trim().slice(0, 120), 'CONVERSATION', c.id);
+        }
+        return ok(clone(c));
+      }
       /* unread = for the admin, empUnread = for the employee */
       var fromAdmin = Number(fromId) === Number(DB.adminUser.id);
       var preview = String(text).trim().slice(0, 120);
@@ -1263,9 +1354,27 @@
       }
       return ok(clone(c));
     },
-    /* side: 'EMPLOYEE' clears the employee's unread count, otherwise the admin's */
+    /* Employee ↔ employee chat (any department): reuse or start one */
+    startPeerConversation: function (meId, otherId) {
+      var a = Number(meId), b = Number(otherId);
+      if (a === b) return fail('Pick a colleague, not yourself', 'VALIDATION');
+      var me = DB.employees.find(function (e) { return e.id === a; });
+      var other = DB.employees.find(function (e) { return e.id === b && e.active !== false; });
+      if (!me || !other) return fail('Employee not found', 'NOT_FOUND');
+      var c = DB.conversations.find(function (x) {
+        return x.kind === 'PEER' && (x.participantIds || []).indexOf(a) >= 0 && (x.participantIds || []).indexOf(b) >= 0;
+      });
+      if (!c) {
+        c = { id: U.newId('conv'), kind: 'PEER', participantIds: [a, b], unreadBy: {}, msgs: [] };
+        DB.conversations.unshift(c);
+      }
+      return ok(clone(c));
+    },
+    /* side: 'EMPLOYEE' clears the employee's unread count, otherwise the admin's;
+       in an employee ↔ employee chat, side is the reader's id */
     markConversationRead: function (conversationId, side) {
       var c = findOr404(DB.conversations, conversationId);
+      if (c && c.kind === 'PEER') { c.unreadBy = c.unreadBy || {}; if (side != null) c.unreadBy[Number(side)] = 0; return ok(clone(c)); }
       if (c) { if (side === 'EMPLOYEE') c.empUnread = 0; else c.unread = 0; }
       return ok(c ? clone(c) : null);
     },
